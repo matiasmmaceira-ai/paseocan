@@ -185,11 +185,11 @@
  *     S2  lib/helpers.js       — bolsa mixta (224 líneas): fechas (td, ds,
  *                                wkRange, moKey, addWks/addMos/addDays,
  *                                edadTxt, addMin, fmtHs), formato/validación
- *                                (numInt, numPct, uid), precios
+ *                                (numInt, numPct, numPos, uid), precios
  *                                (precioFijo, grpEff, TRAER_PREDEF,
  *                                traerLabel, traerBaseDeCfg), contacto/mapas
  *                                (waLink, DEFAULT_WA_TPL, fillTemplate,
- *                                mapsLink, mapsRoute,
+ *                                mapsLink, mapsLinkMulti, mapsRoute,
  *                                mapsSearch, clientAddrs, clientMainAddrId,
  *                                clientAddrText, syncClientAddr), grupo/paseo
  *                                (isPaseoDeGrupo, isCompImpago). Si algún día
@@ -329,8 +329,8 @@ function TextoAuto(_b) {
  *     Constantes: DAYS, MONTHS
  *     Fechas: p2, td, ds, wkRange, addMin, addWks, addMos, addDays, findActivaDay
  *     Plata: $ (formato)
- *     Links: waLink, mapsLink, mapsRoute
- *     Validación: numInt, numPct
+ *     Links: waLink, mapsLink, mapsLinkMulti, mapsRoute
+ *     Validación: numInt, numPct, numPos
  *     IDs: uid
  *     Formato: fmtHs (minutos a "Xh Ymin", centralizada acá)
  *
@@ -986,7 +986,17 @@ function avisosSalud(dogs, cfg, T) {
         out.push({ dogId: d.id, dogName: d.name, cid: d.cid, tipoId: e.tipo.id, nombre: e.tipo.nombre, proxima: e.proxima, estado: e.estado }); }); });
     return out.sort((a, b) => a.proxima.localeCompare(b.proxima));
 }
+// resumenSalud: el peor estado del perro ("vencida" > "pronto" > null) para las etiquetas.
+function resumenSalud(dog, cfg, T) {
+    const es = estadoSalud(dog, cfg, T);
+    if (es.some(e => e.estado === "vencida"))
+        return "vencida";
+    if (es.some(e => e.estado === "pronto"))
+        return "pronto";
+    return null;
+}
 const mapsLink = (a, b) => `https://www.google.com/maps/dir/${encodeURIComponent(a)}/${encodeURIComponent(b)}/data=!4m2!4m1!3e2`;
+const mapsLinkMulti = (pts) => "https://www.google.com/maps/dir/" + pts.map(p => encodeURIComponent(p)).join("/");
 const mapsRoute = stops => `https://www.google.com/maps/dir/${stops.filter(Boolean).map(encodeURIComponent).join("/")}/data=!4m2!4m1!3e2`;
 // mapsSearch: para un solo punto (una dirección, sin tramo de origen/destino) —
 // abre un pin en Maps en vez de una ruta con indicaciones. Usado en Estadía y
@@ -1234,7 +1244,9 @@ const numInt = v => { const n = parseInt(v); return isNaN(n) || n < 0 ? 0 : n; }
 // numPct: 0-100, fallback a 0
 const numPct = v => { const n = parseFloat(v); if (isNaN(n))
     return 0; return Math.min(Math.max(n, 0), 100); };
-// Ritmo caminando (26/10/2026): antes era un input numérico (validador numPos, borrado 19/11) → al borrar el número
+// numPos: numero positivo > 0, fallback a un valor por defecto
+const numPos = (v, def) => { const n = Number(v); return isNaN(n) || n <= 0 ? def : n; };
+// Ritmo caminando (26/10/2026): antes era un input numérico con numPos → al borrar el número
 // quedaba 15 y al escribir "20" quedaba 1520 min/km (rompía todos los horarios). Ahora − / +,
 // siempre entre RITMO_MIN y RITMO_MAX. Un valor raro guardado se lleva al borde más cercano.
 const RITMO_MIN = 5, RITMO_MAX = 40;
@@ -1744,6 +1756,20 @@ function cobradoNetoPorCliente(paseos, mDogs, from, to, ajPeriodo) {
                 out[cid] = Math.max(out[cid] - a, 0);
         });
     }
+    return out;
+}
+function cobradoNetoPorPerro(paseos, mDogs, from, to) {
+    paseos = normFin(paseos, mDogs);
+    const out = {};
+    (paseos || []).forEach(p => {
+        if (!(p.fecha >= from && p.fecha <= to))
+            return;
+        if (!(p.status === "completado" || (p.status === "programado" && (p.pa || 0) > 0) || (cxlCobrable(p) && (p.pa || 0) > 0)))
+            return;
+        const v = cobradoNetoDePaseo(p, mDogs, paseos);
+        if (v > 0)
+            out[p.dogId] = (out[p.dogId] || 0) + v;
+    });
     return out;
 }
 // cobradoAtribuidoPeriodo: la misma plata que cobradoNetoPeriodo, pero atribuida
@@ -2313,7 +2339,7 @@ function nombreDato(k) { return NOMBRE_DATO[k] || k; }
 // HTML: la base solo deja hacer lo que permiten sus reglas (RLS). NUNCA poner acá la secret/service_role.
 const SUPA_URL = "https://zwuakvfsgesdeiioimcj.supabase.co";
 const SUPA_KEY = "sb_publishable_aIkR9AH_aUigZVcm_eNlKQ_1eMtomWx";
-const APP_VER = "2026-11-20c";
+const APP_VER = "2026-11-18";
 // Contador anónimo (Matías: "¿vamos a saber cuánta gente la está usando?"): una vez por día que se abre
 // la app, manda SOLO un número al azar de este celular + la versión. Sin nombre, mail ni datos. La
 // tabla `aperturas` solo deja anotar (nadie la lee desde la app). Se apaga en Configuración > Privacidad.
@@ -2344,25 +2370,7 @@ async function contarApertura(fetchFn, { url, key, inst, ver }) {
 // un celular"). Sin librerías: la API REST de Supabase con fetch. Cada usuario entra con SU mail (código de
 // 6 a 8 números o el link del mail) y tiene UNA fila en `respaldos` (mismo formato que el backup) que solo él
 // puede ver/tocar (RLS). Las funciones son puras y reciben fetch para poder probarlas sin red.
-const NUBE_ESPERA_MS = 10000; // sincroniza 10 s después del último cambio (20/11: antes 30 s; con dos aparatos se nota)
-const NUBE_MIRAR_MS = 60000; // con la app abierta y a la vista, mira cada minuto si el otro aparato guardó (solo la hora: casi nada de datos)
-// fetch con tiempo máximo: una conexión colgada no puede dejar la sincronización trabada hasta cerrar la app.
-function nubeFetchCon(ms) {
-    return (url, opt) => {
-        let c = null;
-        try {
-            c = new AbortController();
-        }
-        catch (e) { }
-        const t = c ? setTimeout(() => { try {
-            c.abort();
-        }
-        catch (e) { } }, ms) : null;
-        const pr = fetch(url, c ? Object.assign(Object.assign({}, (opt || {})), { signal: c.signal }) : opt);
-        return pr.finally ? pr.finally(() => { if (t)
-            clearTimeout(t); }) : pr;
-    };
-}
+const NUBE_ESPERA_MS = 30000; // sube 30 s después del último cambio
 function nubeHeaders(tok) { const h = { apikey: SUPA_KEY, "Content-Type": "application/json" }; if (tok)
     h.Authorization = "Bearer " + tok; return h; }
 async function nubeJson(r) { try {
@@ -2452,7 +2460,7 @@ const MUDANZA_V = 1;
 function esOrigenViejo(host) { return /(^|\.)github\.io$/i.test(String(host || "")); }
 // Qué claves viajan: todas las pc_* menos la sesión de la nube (se vuelve a entrar con el código),
 // las marcas de la propia mudanza y las copias de datos dañados.
-function mudanzaIncluye(k) { k = String(k || ""); return /^pc_/.test(k) && k !== "pc_nube" && !/^pc_sync_/.test(k) && k !== "pc_mudado" && k !== "pc_mudanza_res" && k !== "pc_mudanza_pend" && !/^pc_danado_/.test(k); }
+function mudanzaIncluye(k) { k = String(k || ""); return /^pc_/.test(k) && k !== "pc_nube" && k !== "pc_mudado" && k !== "pc_mudanza_res" && k !== "pc_mudanza_pend" && !/^pc_danado_/.test(k); }
 function b64urlDeBytes(u8) { let bin = ""; const T = 0x8000; for (let i = 0; i < u8.length; i += T)
     bin += String.fromCharCode.apply(null, Array.prototype.slice.call(u8, i, i + T)); return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); }
 function bytesDeB64url(s) { s = String(s || "").replace(/-/g, "+").replace(/_/g, "/"); while (s.length % 4)
@@ -2630,627 +2638,6 @@ function nubeChip(estado, ultSubida, ahoraMs) {
         return { t: "☁️ guardando…", tono: "grn" };
     return { t: "☁️ guardado " + cuandoTxt(ultSubida, ahoraMs), tono: "grn" };
 }
-// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
-// SINCRONIZACIÓN ENTRE APARATOS (20/11/2026) — parte 1: la MEZCLA (funciones puras, todavía sin conectar).
-// Pedido de Matías: "si cobraste en la computadora, en el celular aparezca como cobrado; si lo modificás en el
-// celu, en la computadora aparezca modificado. No importa dónde lo hacés." → siempre gana el ÚLTIMO CAMBIO.
-// Diseño completo: DISEÑO_sincronizacion.md.
-//
-// Mezcla de TRES vías: base = cómo estaba todo la última vez que este aparato se puso de acuerdo con la nube;
-// mio = este aparato; nube = lo que hay arriba. Se compara contra la base para saber QUÉ cambió cada uno:
-//  · lo que cambió uno solo, se toma (sin mirar relojes: un reloj atrasado no puede pisar nada);
-//  · lo que cambiaron los dos distinto, gana el que se cambió MÁS TARDE (mod = hora de cada cambio, por registro).
-// Reglas finas (pensadas para no inventar ni perder plata):
-//  · Registros de PLATA (paseos, estadías, clases, ventas): si los dos tocaron el mismo, se toma ENTERO el
-//    ganador (nunca se mezcla el "pa" de uno con el "status" del otro). Adentro, las listas con id (pagos de
-//    una estadía, etc.) se juntan pago por pago: cada pago es plata que entró de verdad.
-//  · Resto (clientes, perros, ajustes…): campo por campo; si los dos tocaron el mismo campo, gana el más tardío.
-//  · Borrado contra cambio: gana el más tardío. Borrar un cliente borra sus perros y paseos (como la app); si en
-//    el otro aparato se TRABAJÓ un paseo de ese perro después (hecho, cancelado, cobrado), el perro y el cliente
-//    vuelven: no se tira plata. Un paseo armado solo por la app (programado sin tocar) no revive nada.
-//  · Paseos que arma la app sola: cada aparato les pone un id al azar → el mismo paseo (perro + día + grupo)
-//    puede aparecer dos veces; se deja uno (el más trabajado; si no, el que ya estaba).
-// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
-const SYNC_LISTAS = { dogs: "id", clients: "id", gg: "id", paseos: "id", guarderias: "id", adiestramiento: "id", articulos: "id", ventas: "id", routes: "key" };
-const SYNC_MAPAS = ["ajustes", "congeladas", "ajPeriodo", "edgeMemory", "waTpl", "cfg", "partes", "globalRoute"];
-const SYNC_PLATA = { paseos: 1, guarderias: 1, adiestramiento: 1, ventas: 1 };
-// Mapas cuyos valores son plata o fotos que no se pueden mezclar por dentro (ej. ajuste {type,val}: nunca el tipo
-// de un aparato con el monto del otro): cada valor va entero.
-const SYNC_MAPAS_ENTERO = { ajustes: 1, congeladas: 1, ajPeriodo: 1, edgeMemory: 1, partes: 1 };
-const SYNC_TOMB_DIAS = 120;
-// Igualdad profunda sin importar el orden de las claves (dos aparatos pueden guardar el mismo objeto con las claves
-// en otro orden). undefined y "ausente" valen lo mismo, como en JSON.
-function syncIgual(a, b) {
-    if (a === b)
-        return true;
-    if (a == null || b == null)
-        return a == null && b == null;
-    if (typeof a !== "object" || typeof b !== "object")
-        return typeof a === "number" && typeof b === "number" ? (a === b || (isNaN(a) && isNaN(b))) : false;
-    const aa = Array.isArray(a), ab = Array.isArray(b);
-    if (aa !== ab)
-        return false;
-    if (aa) {
-        if (a.length !== b.length)
-            return false;
-        for (let i = 0; i < a.length; i++)
-            if (!syncIgual(a[i], b[i]))
-                return false;
-        return true;
-    }
-    const ka = Object.keys(a).filter(k => a[k] !== undefined), kb = Object.keys(b).filter(k => b[k] !== undefined);
-    if (ka.length !== kb.length)
-        return false;
-    for (const k of ka) {
-        if (!Object.prototype.hasOwnProperty.call(b, k) || !syncIgual(a[k], b[k]))
-            return false;
-    }
-    return true;
-}
-const syncEsObj = x => !!x && typeof x === "object" && !Array.isArray(x);
-// Lista de objetos que se pueden seguir uno por uno (todos con id distinto).
-function syncListaConId(x) {
-    if (!Array.isArray(x) || !x.length)
-        return false;
-    const s = new Set();
-    for (const e of x) {
-        if (!syncEsObj(e) || e.id == null || s.has(e.id))
-            return false;
-        s.add(e.id);
-    }
-    return true;
-}
-// Lista con id o todavía vacía (el primer pago de una estadía llega a una lista que no existía).
-function syncListaIdOVacia(x) { return x == null || (Array.isArray(x) && (x.length === 0 || syncListaConId(x))); }
-function syncJuntaPorId(b, m, n) { return syncListaIdOVacia(b) && syncListaIdOVacia(m) && syncListaIdOVacia(n) && (syncListaConId(m) || syncListaConId(n)); }
-// Hora del último cambio de un registro según el registro de cambios: número = cambiado; {b:t} = borrado.
-function syncT(mod, k) { const v = mod && mod[k]; if (v == null)
-    return 0; if (typeof v === "number")
-    return v; return Number(v.b) || 0; }
-function syncBorrado(mod, k) { const v = mod && mod[k]; return !!(v && typeof v === "object" && v.b); }
-// Lista anidada (pagos de una estadía, grupos de un perro…): se junta elemento por elemento con la misma
-// regla, usando la hora del registro que la contiene.
-function syncMezclarAnidada(b, m, n, tm, tn) {
-    const L = x => Array.isArray(x) ? x : [];
-    const ib = new Map(L(b).filter(syncEsObj).map(e => [e.id, e])), im = new Map(L(m).map(e => [e.id, e])), inn = new Map(L(n).map(e => [e.id, e]));
-    const orden = [];
-    const visto = new Set();
-    for (const e of L(m).concat(L(n))) {
-        if (!visto.has(e.id)) {
-            visto.add(e.id);
-            orden.push(e.id);
-        }
-    }
-    const out = [];
-    for (const id of orden) {
-        const x = syncMezclarValor(ib.has(id) ? ib.get(id) : undefined, im.has(id) ? im.get(id) : undefined, inn.has(id) ? inn.get(id) : undefined, tm, tn, true, ib.has(id));
-        if (x !== undefined)
-            out.push(x);
-    }
-    return out;
-}
-// Un valor (registro entero o campo). enBase: existía en la base. entero: no se mezcla adentro (plata).
-function syncMezclarValor(b, m, n, tm, tn, entero, enBase) {
-    const hayB = enBase !== undefined ? enBase : b !== undefined;
-    if (m === undefined && n === undefined)
-        return undefined;
-    if (!hayB) { // nuevo de los dos lados (mismo id): si coinciden, uno; si no, el más tardío
-        if (m === undefined)
-            return n;
-        if (n === undefined)
-            return m;
-        if (syncIgual(m, n))
-            return m;
-        if (syncJuntaPorId(undefined, m, n))
-            return syncMezclarAnidada(undefined, m, n, tm, tn);
-        return tn > tm ? n : m;
-    }
-    if (m === undefined) { // lo borró este aparato
-        if (syncIgual(n, b))
-            return undefined;
-        return tn > tm ? n : undefined;
-    }
-    if (n === undefined) {
-        if (syncIgual(m, b))
-            return undefined;
-        return tm > tn ? m : undefined;
-    }
-    const cm = !syncIgual(m, b), cn = !syncIgual(n, b);
-    if (!cm)
-        return n;
-    if (!cn)
-        return m;
-    if (syncIgual(m, n))
-        return m;
-    // Cambiaron los dos y distinto.
-    const gana = tn > tm ? n : m, pierde = tn > tm ? m : n;
-    if (syncJuntaPorId(b, m, n))
-        return syncMezclarAnidada(b, m, n, tm, tn);
-    if (!syncEsObj(m) || !syncEsObj(n) || !syncEsObj(b))
-        return gana;
-    if (entero) { // registro de plata: el ganador entero, salvo sus listas con id (cada pago es plata de verdad)
-        const out = Object.assign({}, gana);
-        for (const k of Object.keys(gana).concat(Object.keys(pierde))) {
-            if (syncJuntaPorId(b[k], m[k], n[k]) && !syncIgual(m[k], n[k])) {
-                const x = syncMezclarAnidada(b[k], m[k], n[k], tm, tn);
-                if (x.length || Array.isArray(gana[k]))
-                    out[k] = x;
-                else
-                    delete out[k];
-            }
-        }
-        return out;
-    }
-    const out = {};
-    const ks = new Set(Object.keys(b).concat(Object.keys(m), Object.keys(n)));
-    for (const k of ks) {
-        const x = syncMezclarValor(b[k], m[k], n[k], tm, tn, false, b[k] !== undefined);
-        if (x !== undefined)
-            out[k] = x;
-    }
-    return out;
-}
-// Paseo trabajado por alguien (no solo armado por la app).
-function syncPaseoTrabajado(p) { return !!p && (p.manual || (p.status && p.status !== "programado") || (Number(p.pa) || 0) > 0 || p.moved || p.paid); }
-function syncListaAMapa(lista, clave) { const m = new Map(); (Array.isArray(lista) ? lista : []).forEach(e => { if (e && e[clave] != null && !m.has(e[clave]))
-    m.set(e[clave], e); }); return m; }
-// Mezcla una colección de la lista (por id/key). Devuelve {lista, mod, choques}.
-function syncMezclarLista(col, b, m, n, modM, modN) {
-    const clave = SYNC_LISTAS[col] || "id", entero = !!SYNC_PLATA[col];
-    const ib = syncListaAMapa(b, clave), im = syncListaAMapa(m, clave), inn = syncListaAMapa(n, clave);
-    const orden = [];
-    const visto = new Set();
-    [m, n].forEach(l => (Array.isArray(l) ? l : []).forEach(e => { const k = e && e[clave]; if (k != null && !visto.has(k)) {
-        visto.add(k);
-        orden.push(k);
-    } }));
-    // Los borrados por los dos no entran en "orden" pero sí en el registro de cambios.
-    const lista = [], mod = {}, choques = [];
-    for (const k of orden) {
-        const tm = syncT(modM, k), tn = syncT(modN, k);
-        const x = syncMezclarValor(ib.get(k), im.get(k), inn.get(k), tm, tn, entero, ib.has(k));
-        const cm = im.has(k) ? !syncIgual(im.get(k), ib.get(k)) : ib.has(k), cn = inn.has(k) ? !syncIgual(inn.get(k), ib.get(k)) : ib.has(k);
-        if (cm && cn && !syncIgual(im.get(k), inn.get(k)))
-            choques.push({ col, k, gano: tn > tm ? "nube" : "mio" });
-        if (x !== undefined) {
-            lista.push(x);
-            const t = Math.max(tm, tn);
-            if (t)
-                mod[k] = t;
-        }
-        else {
-            const t = Math.max(tm, tn);
-            mod[k] = { b: t || 1 };
-        }
-    }
-    // Tumbas que vienen de cualquiera de los dos y no están en la lista.
-    [modM, modN].forEach(mm => Object.keys(mm || {}).forEach(k => { if (syncBorrado(mm, k) && !(k in mod))
-        mod[k] = { b: syncT(mm, k) };
-    else if (syncBorrado(mm, k) && syncBorrado(mod, k))
-        mod[k] = { b: Math.max(syncT(mod, k), syncT(mm, k)) }; }));
-    // Lo que no se puede seguir por id (sin id, o id repetido por datos dañados) NO se tira: queda el de este aparato
-    // y se suma el de la nube que no esté igual acá. Nunca se pierde un registro por no tener id.
-    const raros = l => { const vis = new Set(), out = []; (Array.isArray(l) ? l : []).forEach(e => { const k = e && e[clave]; if (k == null || vis.has(k))
-        out.push(e);
-    else
-        vis.add(k); }); return out; };
-    const rm = raros(m), rn = raros(n);
-    rm.forEach(e => lista.push(e));
-    rn.forEach(e => { if (!rm.some(x => syncIgual(x, e)))
-        lista.push(e); });
-    return { lista, mod, choques };
-}
-// Mapa de primer nivel (cfg, ajustes…): clave por clave con la misma regla.
-function syncMezclarMapa(b, m, n, modM, modN, entero) {
-    const B = syncEsObj(b) ? b : {}, Mi = syncEsObj(m) ? m : {}, Nu = syncEsObj(n) ? n : {};
-    const out = {}, mod = {}, choques = [];
-    const ks = new Set(Object.keys(B).concat(Object.keys(Mi), Object.keys(Nu)));
-    for (const k of ks) {
-        const tm = syncT(modM, k), tn = syncT(modN, k);
-        const x = syncMezclarValor(B[k], Mi[k], Nu[k], tm, tn, !!entero, B[k] !== undefined);
-        if (Mi[k] !== undefined && Nu[k] !== undefined && !syncIgual(Mi[k], B[k]) && !syncIgual(Nu[k], B[k]) && !syncIgual(Mi[k], Nu[k]))
-            choques.push({ k, gano: tn > tm ? "nube" : "mio" });
-        if (x !== undefined) {
-            out[k] = x;
-            const t = Math.max(tm, tn);
-            if (t)
-                mod[k] = t;
-        }
-        else {
-            mod[k] = { b: Math.max(tm, tn) || 1 };
-        }
-    }
-    [modM, modN].forEach(mm => Object.keys(mm || {}).forEach(k => { if (syncBorrado(mm, k) && !(k in mod))
-        mod[k] = { b: syncT(mm, k) }; }));
-    return { mapa: out, mod, choques };
-}
-// Registros repetidos que armó la app sola en cada aparato (ids al azar): paseos programados (mismo perro + día
-// original + grupo) y jornadas de estadías recurrentes (misma serie + día original). Queda uno solo de los que NADIE
-// trabajó; los trabajados (hechos, cancelados, cobrados, movidos) no se tiran nunca: si hubiera dos trabajados,
-// quedan los dos (mejor verlo doble que perder plata).
-function syncPaseoAuto(p) { return !!p && !p.manual && p.dogId != null && !!p.fecha; }
-function syncClavePaseo(p) { return p.dogId + "|" + (p.moved && p.originalFecha ? p.originalFecha : p.fecha) + "|" + (p.dgid || p.gid || ""); }
-function syncEstadiaAuto(e) { return !!e && e.recurId != null && !!e.desde; }
-function syncClaveEstadia(e) { return e.recurId + "|" + (e.moved && e.origDesde ? e.origDesde : e.desde); }
-function syncEstadiaTrabajada(e) { return !!e && ((e.estado && e.estado !== "programada") || e.hecho || (Array.isArray(e.pagos) && e.pagos.length > 0) || e.moved || (e.dadas && Object.keys(e.dadas).length > 0)); }
-function syncSacarDobles(lista, esAuto, clave, trabajado, baseIds, mod) {
-    const grupos = new Map();
-    lista.forEach(p => { if (!esAuto(p))
-        return; const k = clave(p); if (!grupos.has(k))
-        grupos.set(k, []); grupos.get(k).push(p); });
-    const fuera = new Set();
-    for (const ps of grupos.values()) {
-        if (ps.length < 2)
-            continue;
-        if (!ps.some(p => !baseIds.has(p.id)))
-            continue; // dobles viejos: no son de la sync, no se tocan
-        const trab = ps.filter(trabajado), libres = ps.filter(p => !trabajado(p));
-        if (trab.length) {
-            libres.forEach(p => fuera.add(p.id));
-            continue;
-        }
-        const orden = libres.slice().sort((a, b) => (baseIds.has(b.id) ? 1 : 0) - (baseIds.has(a.id) ? 1 : 0) || syncT(mod, b.id) - syncT(mod, a.id) || String(a.id).localeCompare(String(b.id)));
-        orden.slice(1).forEach(p => fuera.add(p.id));
-    }
-    return { lista: lista.filter(p => !fuera.has(p && p.id)), quitados: [...fuera] };
-}
-function syncSacarPaseosDobles(paseos, baseIds, mod) { const r = syncSacarDobles(paseos, syncPaseoAuto, syncClavePaseo, syncPaseoTrabajado, baseIds, mod); return { paseos: r.lista, quitados: r.quitados }; }
-// Lo que borra la app en cascada (cliente → perros → paseos) se respeta después de mezclar; si del otro lado se
-// trabajó algo después del borrado, vuelve el padre (no se pierde plata).
-function syncCascada(datos, mod, mio, nube, base, modMio, modNube) {
-    const d = Object.assign({}, datos), md = Object.assign({}, mod);
-    // Si hay que revivir un perro o un cliente: la versión más nueva que tenga cualquiera de los dos aparatos.
-    const buscar = (col, id) => {
-        const en = f => (f && Array.isArray(f[col]) ? f[col] : []).find(e => e && e.id === id) || null;
-        const xm = en(mio), xn = en(nube), tm = syncT(modMio && modMio[col], id), tn = syncT(modNube && modNube[col], id);
-        if (xm && xn)
-            return tn > tm ? xn : xm;
-        return xm || xn || en(base);
-    };
-    const revividos = { dogs: [], clients: [] }, caidos = { dogs: [], paseos: [] };
-    // 1) paseos de perros borrados
-    let dogIds = new Set((d.dogs || []).map(x => x.id));
-    const mDogs = md.dogs || {}, mPas = md.paseos || {};
-    const reviveDog = new Map();
-    (d.paseos || []).forEach(p => {
-        if (!p || dogIds.has(p.dogId) || !syncBorrado(mDogs, p.dogId))
-            return;
-        if (syncPaseoTrabajado(p) && syncT(mPas, p.id) > syncT(mDogs, p.dogId))
-            reviveDog.set(p.dogId, Math.max(reviveDog.get(p.dogId) || 0, syncT(mPas, p.id)));
-    });
-    if (reviveDog.size) {
-        const nd = (d.dogs || []).slice();
-        const ndm = Object.assign({}, mDogs);
-        reviveDog.forEach((t, id) => { const x = buscar("dogs", id); if (x) {
-            nd.push(x);
-            ndm[id] = t;
-            revividos.dogs.push(id);
-        } });
-        d.dogs = nd;
-        md.dogs = ndm;
-        dogIds = new Set(nd.map(x => x.id));
-    }
-    // 2) perros de clientes borrados
-    let cliIds = new Set((d.clients || []).map(x => x.id));
-    const mCli = md.clients || {};
-    const tDog = new Map();
-    (d.dogs || []).forEach(x => tDog.set(x.id, syncT(md.dogs, x.id)));
-    (d.paseos || []).forEach(p => { if (p && syncPaseoTrabajado(p) && tDog.has(p.dogId))
-        tDog.set(p.dogId, Math.max(tDog.get(p.dogId), syncT(mPas, p.id))); });
-    const reviveCli = new Map(), dropDog = new Map();
-    (d.dogs || []).forEach(x => {
-        if (cliIds.has(x.cid) || !syncBorrado(mCli, x.cid))
-            return;
-        if (tDog.get(x.id) > syncT(mCli, x.cid))
-            reviveCli.set(x.cid, Math.max(reviveCli.get(x.cid) || 0, tDog.get(x.id)));
-        else
-            dropDog.set(x.id, syncT(mCli, x.cid));
-    });
-    // Si un perro del cliente revive al cliente, ningún hermano se cae.
-    dropDog.forEach((t, id) => { const x = (d.dogs || []).find(e => e.id === id); if (x && reviveCli.has(x.cid))
-        dropDog.delete(id); });
-    if (reviveCli.size) {
-        const nc = (d.clients || []).slice();
-        const ncm = Object.assign({}, mCli);
-        reviveCli.forEach((t, id) => { const x = buscar("clients", id); if (x) {
-            nc.push(x);
-            ncm[id] = t;
-            revividos.clients.push(id);
-        } });
-        d.clients = nc;
-        md.clients = ncm;
-        cliIds = new Set(nc.map(x => x.id));
-    }
-    if (dropDog.size) {
-        const ndm = Object.assign({}, (md.dogs || {}));
-        dropDog.forEach((t, id) => { ndm[id] = { b: t }; caidos.dogs.push(id); });
-        md.dogs = ndm;
-        d.dogs = (d.dogs || []).filter(x => !dropDog.has(x.id));
-        dogIds = new Set(d.dogs.map(x => x.id));
-    }
-    // 3) paseos que quedaron sin perro por un borrado (de este paso o de la mezcla): se van, como en la app
-    const mD2 = md.dogs || {};
-    const npm = Object.assign({}, (md.paseos || {}));
-    d.paseos = (d.paseos || []).filter(p => {
-        if (!p || dogIds.has(p.dogId) || !syncBorrado(mD2, p.dogId))
-            return true;
-        if (syncPaseoTrabajado(p) && syncT(npm, p.id) > syncT(mD2, p.dogId))
-            return true; // no debería pasar (revivió), por las dudas no se tira
-        npm[p.id] = { b: syncT(mD2, p.dogId) };
-        caidos.paseos.push(p.id);
-        return false;
-    });
-    md.paseos = npm;
-    return { datos: d, mod: md, revividos, caidos };
-}
-// Tumbas viejas se olvidan (si un aparato no se conecta en 4 meses, se le pregunta como la primera vez).
-function syncPodarTumbas(mod, ahoraMs) {
-    const lim = ahoraMs - SYNC_TOMB_DIAS * 86400000;
-    const out = {};
-    Object.keys(mod || {}).forEach(col => { const o = {}; Object.keys(mod[col] || {}).forEach(k => { const v = mod[col][k]; if (v && typeof v === "object" && v.b && v.b < lim)
-        return; o[k] = v; }); out[col] = o; });
-    return out;
-}
-// LA MEZCLA. base/mio/nube = {datos, mod}. datos = backup (como buildBackupData). mod = {col:{id:t|{b:t}}}.
-function mezclarTres(base, mio, nube) {
-    const B = (base && base.datos) || {}, Mi = (mio && mio.datos) || {}, Nu = (nube && nube.datos) || {};
-    const mM = (mio && mio.mod) || {}, mN = (nube && nube.mod) || {};
-    const datos = {}, mod = {}, choques = [];
-    Object.keys(SYNC_LISTAS).forEach(col => {
-        if (Mi[col] === undefined && Nu[col] === undefined && B[col] === undefined)
-            return;
-        const r = syncMezclarLista(col, B[col], Mi[col], Nu[col], mM[col], mN[col]);
-        datos[col] = r.lista;
-        mod[col] = r.mod;
-        r.choques.forEach(c => choques.push(c));
-    });
-    SYNC_MAPAS.forEach(col => {
-        if (Mi[col] === undefined && Nu[col] === undefined && B[col] === undefined)
-            return;
-        const r = syncMezclarMapa(B[col], Mi[col], Nu[col], mM[col], mN[col], !!SYNC_MAPAS_ENTERO[col]);
-        datos[col] = r.mapa;
-        mod[col] = r.mod;
-        r.choques.forEach(c => choques.push(Object.assign({ col }, c)));
-    });
-    // Lo que no conocemos (una versión más nueva de la app): se conserva el más tardío entero.
-    Object.keys(Mi).concat(Object.keys(Nu)).forEach(k => {
-        if (k in datos || k === "ts" || k === "v" || k === "_nube" || k === "_sync" || SYNC_LISTAS[k] || SYNC_MAPAS.includes(k))
-            return;
-        datos[k] = Nu[k] !== undefined && (Mi[k] === undefined || (!syncIgual(Nu[k], B[k]) && syncIgual(Mi[k], B[k]))) ? Nu[k] : Mi[k];
-    });
-    // Paseos dobles armados por la app en cada aparato.
-    let quitados = [];
-    [["paseos", syncPaseoAuto, syncClavePaseo, syncPaseoTrabajado], ["guarderias", syncEstadiaAuto, syncClaveEstadia, syncEstadiaTrabajada]].forEach(([col, esAuto, clave, trab]) => {
-        if (!Array.isArray(datos[col]))
-            return;
-        const baseIds = new Set((Array.isArray(B[col]) ? B[col] : []).map(p => p && p.id));
-        const r = syncSacarDobles(datos[col], esAuto, clave, trab, baseIds, mod[col] || {});
-        datos[col] = r.lista;
-        if (r.quitados.length) {
-            mod[col] = Object.assign({}, (mod[col] || {}));
-            r.quitados.forEach(id => { mod[col][id] = { b: Math.max(syncT(mM[col], id), syncT(mN[col], id)) || 1 }; });
-            quitados = quitados.concat(r.quitados);
-        }
-    });
-    const cas = syncCascada(datos, mod, Mi, Nu, B, mM, mN);
-    return { datos: Object.assign(Object.assign({}, cas.datos), { v: Mi.v || Nu.v || B.v }), mod: cas.mod, resumen: { choques, dobles: quitados, revividos: cas.revividos, caidos: cas.caidos } };
-}
-// Registro de cambios: al guardar, se compara lo anterior con lo nuevo y se anota la hora de cada registro que
-// cambió (o se borró). Así, aunque el aparato esté sin señal, se sabe QUÉ cambió y CUÁNDO.
-// bajo=true: cambios que hizo la app sola al abrir (migraciones, arreglos), ANTES de que la persona toque nada:
-// se anotan como cambiados pero sin hora (no bajan una hora que ya estaba) → en un choque pierden contra un cambio de
-// verdad del otro aparato (ej.: un cobro que se hizo en la compu no lo pisa una migración que corrió en el celular).
-function registrarCambios(prev, next, mod, ahoraMs, bajo) {
-    const P = prev || {}, N = next || {};
-    const out = Object.assign({}, (mod || {}));
-    if (bajo) {
-        const viejo = (col, k) => { const v = out[col] && out[col][k]; return typeof v === "number" ? v : 1; };
-        const r = registrarCambios(prev, next, {}, 1);
-        Object.keys(r).forEach(col => { const o = Object.assign({}, (out[col] || {})); Object.keys(r[col]).forEach(k => { o[k] = syncBorrado(r[col], k) ? { b: viejo(col, k) } : viejo(col, k); }); out[col] = o; });
-        return out;
-    }
-    Object.keys(SYNC_LISTAS).forEach(col => {
-        const clave = SYNC_LISTAS[col];
-        const a = P[col], b = N[col];
-        if (a === b)
-            return;
-        const ia = syncListaAMapa(a, clave), ib = syncListaAMapa(b, clave);
-        let o = null;
-        const toca = () => { if (!o)
-            o = Object.assign({}, (out[col] || {})); return o; };
-        ib.forEach((x, k) => { const y = ia.get(k); if (y === x)
-            return; if (y === undefined || !syncIgual(x, y))
-            toca()[k] = ahoraMs; });
-        ia.forEach((y, k) => { if (!ib.has(k))
-            toca()[k] = { b: ahoraMs }; });
-        if (o)
-            out[col] = o;
-    });
-    SYNC_MAPAS.forEach(col => {
-        const a = syncEsObj(P[col]) ? P[col] : {}, b = syncEsObj(N[col]) ? N[col] : {};
-        if (P[col] === N[col])
-            return;
-        let o = null;
-        const toca = () => { if (!o)
-            o = Object.assign({}, (out[col] || {})); return o; };
-        Object.keys(b).forEach(k => { if (a[k] === b[k])
-            return; if (!syncIgual(a[k], b[k]))
-            toca()[k] = ahoraMs; });
-        Object.keys(a).forEach(k => { if (!(k in b) || b[k] === undefined)
-            toca()[k] = { b: ahoraMs }; });
-        if (o)
-            out[col] = o;
-    });
-    return out;
-}
-// ═══ SINCRONIZACIÓN — parte 2: conectada a la nube (20/11/2026) ═══
-// La fila de la nube guarda el backup + _nube {inst, at} (quién y cuándo, lo usa también la versión vieja) +
-// _sync {mod} (el registro de cambios acumulado). Cada aparato guarda localmente:
-//  · pc_sync_base: {uid, datos, actualizado} = cómo quedó todo la última vez que se puso de acuerdo con la nube;
-//  · pc_sync_mod: su registro de cambios (qué registro cambió y a qué hora lo cambió la persona).
-// Ajustes de configuración que son de CADA aparato (no viajan): el tamaño de letra del celular no es el de la compu.
-const SYNC_CFG_LOCAL = ["textScale"];
-function syncDejarLocales(datos, local) {
-    if (!datos || !datos.cfg || !local || !local.cfg)
-        return datos;
-    const cfg = Object.assign({}, datos.cfg);
-    SYNC_CFG_LOCAL.forEach(k => { if (local.cfg[k] === undefined)
-        delete cfg[k];
-    else
-        cfg[k] = local.cfg[k]; });
-    return Object.assign(Object.assign({}, datos), { cfg });
-}
-function nubeDatosDeFila(fila) {
-    const d = (fila && fila.datos) || {};
-    const { _nube, _sync } = d, datos = __rest(d, ["_nube", "_sync"]);
-    return { datos, mod: _sync && syncEsObj(_sync.mod) ? _sync.mod : {} };
-}
-// ¿Los mismos datos? Sin mirar la hora del backup, la versión ni las marcas de la nube.
-function syncMismosDatos(a, b) {
-    const A = a || {}, B = b || {};
-    const fuera = { ts: 1, v: 1, _nube: 1, _sync: 1 };
-    for (const k of new Set(Object.keys(A).concat(Object.keys(B)))) {
-        if (fuera[k])
-            continue;
-        if (!syncIgual(A[k], B[k]))
-            return false;
-    }
-    return true;
-}
-const nubeMismaHora = (a, b) => !!a && !!b && Date.parse(a) === Date.parse(b);
-// Subida "solo si la nube sigue como la vi": PATCH filtrado por la hora de la fila (`antes`). Si otro aparato guardó
-// en el medio, no toca nada y devuelve cambio:true (hay que bajar, mezclar y reintentar). Sin fila: alta (409 = ya hay).
-async function nubeSubirSi(fetchFn, ses, datos, mod, inst, ahoraIso, antes) {
-    const _b = datos || {}, { _nube, _sync } = _b, limpio = __rest(_b, ["_nube", "_sync"]);
-    const d = Object.assign(Object.assign({}, limpio), { _nube: { inst, at: ahoraIso }, _sync: { v: 1, mod: mod || {} } });
-    const h = Object.assign(Object.assign({}, nubeHeaders(ses.access)), { Prefer: "return=representation" });
-    try {
-        let r;
-        if (antes == null)
-            r = await fetchFn(SUPA_URL + "/rest/v1/respaldos?select=actualizado", { method: "POST", headers: h, body: JSON.stringify({ user_id: ses.uid, datos: d, actualizado: ahoraIso }) });
-        else
-            r = await fetchFn(SUPA_URL + "/rest/v1/respaldos?user_id=eq." + encodeURIComponent(ses.uid) + "&actualizado=eq." + encodeURIComponent(antes) + "&select=actualizado", { method: "PATCH", headers: h, body: JSON.stringify({ datos: d, actualizado: ahoraIso }) });
-        if (r && r.status === 409)
-            return { ok: false, cambio: true };
-        if (!r || !r.ok)
-            return { ok: false, status: (r && r.status) || 0 };
-        const j = await nubeJson(r);
-        if (antes != null && (!Array.isArray(j) || !j.length))
-            return { ok: false, cambio: true };
-        return { ok: true, actualizado: (Array.isArray(j) && j[0] && j[0].actualizado) || ahoraIso };
-    }
-    catch (e) {
-        return { ok: false, status: 0 };
-    }
-}
-// Subida entera sin mirar (solo cuando la persona eligió "Usar los de este celular"): pisa la fila.
-async function nubeSubirTodo(fetchFn, ses, datos, mod, inst, ahoraIso) {
-    const _b = datos || {}, { _nube, _sync } = _b, limpio = __rest(_b, ["_nube", "_sync"]);
-    const fila = { user_id: ses.uid, datos: Object.assign(Object.assign({}, limpio), { _nube: { inst, at: ahoraIso }, _sync: { v: 1, mod: mod || {} } }), actualizado: ahoraIso };
-    try {
-        const r = await fetchFn(SUPA_URL + "/rest/v1/respaldos?on_conflict=user_id&select=actualizado", { method: "POST", headers: Object.assign(Object.assign({}, nubeHeaders(ses.access)), { Prefer: "resolution=merge-duplicates,return=representation" }), body: JSON.stringify(fila) });
-        if (!r || !r.ok)
-            return { ok: false, status: (r && r.status) || 0 };
-        const j = await nubeJson(r);
-        return { ok: true, actualizado: (Array.isArray(j) && j[0] && j[0].actualizado) || ahoraIso };
-    }
-    catch (e) {
-        return { ok: false, status: 0 };
-    }
-}
-// UNA sincronización. io = lo que la conecta con la app (así se prueba sin navegador):
-//  leer() → {datos, mod, gen}: anota los cambios pendientes y saca una foto; gen() = contador de cambios locales;
-//  base() / fijarBase(b); aplicar(datos, mod): pone lo mezclado SIN que cuente como cambio local; ultSync(); ahora().
-// Devuelve {estado:"ok"|"pendiente"|"error"|"elegir", ...}. Nunca pisa la nube sin mirar ni aplica encima de algo que
-// la persona tocó mientras tanto (en ese caso vuelve a empezar).
-async function nubeSincronizar(io) {
-    const { fetchFn, ses, inst } = io;
-    const mal = r => ({ estado: r && r.status === 0 ? "pendiente" : "error", status: r && r.status });
-    for (let vuelta = 0; vuelta < 4; vuelta++) {
-        const meta = await nubeLeer(fetchFn, ses, true);
-        if (!meta.ok)
-            return mal(meta);
-        const base = io.base(), L = io.leer(), ahora = io.ahora(), iso = new Date(ahora).toISOString();
-        // Red de seguridad: si la subida condicional dice "cambió" pero la fila sigue con la MISMA hora, el filtro por
-        // hora no está andando en el servidor (no otro aparato): se sube igual (lo mezclado ya incluye lo de arriba).
-        const subir = async (datos, mod, antes) => {
-            const md = syncPodarTumbas(mod, ahora);
-            const r = await nubeSubirSi(fetchFn, ses, datos, md, inst, iso, antes);
-            if (r.cambio && antes != null) {
-                const m2 = await nubeLeer(fetchFn, ses, true);
-                if (m2.ok && m2.fila && nubeMismaHora(m2.fila.actualizado, antes))
-                    return nubeSubirTodo(fetchFn, ses, datos, md, inst, iso);
-            }
-            return r;
-        };
-        // 1) Nube vacía: se sube lo de acá.
-        if (!meta.fila) {
-            const r = await subir(L.datos, L.mod, null);
-            if (r.cambio)
-                continue;
-            if (!r.ok)
-                return mal(r);
-            io.fijarBase({ datos: L.datos, actualizado: r.actualizado });
-            return { estado: "ok", subio: true, hora: r.actualizado };
-        }
-        // 2) Nadie guardó desde la última vez: solo se sube lo de acá (si hay algo). No se baja nada.
-        if (base && nubeMismaHora(meta.fila.actualizado, base.actualizado)) {
-            if (syncMismosDatos(L.datos, base.datos))
-                return { estado: "ok", hora: base.actualizado };
-            const r = await subir(L.datos, L.mod, meta.fila.actualizado);
-            if (r.cambio)
-                continue;
-            if (!r.ok)
-                return mal(r);
-            io.fijarBase({ datos: L.datos, actualizado: r.actualizado });
-            return { estado: "ok", subio: true, hora: r.actualizado };
-        }
-        // 3) Otro aparato guardó (o es la primera vez con este sistema): bajar y mezclar.
-        const full = await nubeLeer(fetchFn, ses, false);
-        if (!full.ok)
-            return mal(full);
-        if (!full.fila)
-            continue;
-        let N;
-        try {
-            const x = nubeDatosDeFila(full.fila);
-            N = { datos: migrateBackup(x.datos), mod: x.mod };
-        }
-        catch (e) {
-            return { estado: "error", err: String((e && e.message) || e) };
-        } // datos de una versión más nueva o rotos: no se toca nada
-        let B = base;
-        if (!B) { // primera vez: si lo de arriba lo subió este mismo aparato (y nadie después), sirve de base; si no, se pregunta
-            if (nubeConflicto(full.fila, inst, io.ultSync()))
-                return { estado: "elegir", fila: full.fila };
-            B = { datos: N.datos };
-        }
-        const L2 = io.leer();
-        const M = mezclarTres({ datos: B.datos }, { datos: L2.datos, mod: L2.mod }, N);
-        const datos = syncDejarLocales(M.datos, L2.datos), mod = syncPodarTumbas(M.mod, ahora);
-        let hora = full.fila.actualizado, subio = false;
-        if (!syncMismosDatos(datos, N.datos)) {
-            const r = await subir(datos, mod, full.fila.actualizado);
-            if (r.cambio)
-                continue;
-            if (!r.ok)
-                return mal(r);
-            hora = r.actualizado;
-            subio = true;
-        }
-        // La persona tocó algo mientras tanto: no se aplica encima. La base pasa a ser la foto que se mezcló (lo que cambió
-        // después queda como cambio de este aparato) y se vuelve a empezar.
-        if (io.gen() !== L2.gen) {
-            if (subio || syncMismosDatos(datos, N.datos))
-                io.fijarBase({ datos: L2.datos, actualizado: null });
-            continue;
-        }
-        io.aplicar(datos, mod);
-        io.fijarBase({ datos, actualizado: hora });
-        return { estado: "ok", subio, bajo: !syncMismosDatos(datos, L2.datos), hora, resumen: M.resumen };
-    }
-    return { estado: "pendiente" };
-}
 const storage = {
     load(key, fallback) {
         const fb = () => (typeof fallback === "function" ? fallback() : fallback);
@@ -3297,16 +2684,6 @@ const storage = {
             PC_SALUD.fallos[key] = (e && e.name) || "error";
             PC_SALUD.pendiente[key] = value;
             avisarSalud();
-            return false;
-        }
-    },
-    // Para copias que se pueden rehacer (la base de la sincronización): si no entra, no se avisa en rojo.
-    guardarSinAviso(key, value) {
-        try {
-            localStorage.setItem(key, JSON.stringify(value));
-            return true;
-        }
-        catch (e) {
             return false;
         }
     },
@@ -4330,6 +3707,15 @@ function setClaseDada(a, fecha, dada) {
         delete clases[fecha];
     return Object.assign(Object.assign({}, b), { clases });
 }
+function setClaseNota(a, fecha, nota) {
+    const b = ensureAdiestra(a || {});
+    const cur = b.clases[fecha] || {};
+    const next = Object.assign(Object.assign({}, cur), { nota: nota || "" });
+    const clases = Object.assign(Object.assign({}, b.clases), { [fecha]: next });
+    if (claseVacia(next))
+        delete clases[fecha];
+    return Object.assign(Object.assign({}, b), { clases });
+}
 // ── REGISTRO DE CADA CLASE (28/10/2026, dibujo aprobado). Además de dada/nota, cada clase guarda
 // temas:[texto], como:"costo"|"bien"|"muybien", comoTxt (unos renglones de cómo le fue, van al
 // cliente), tarea ("para practicar en casa", va al cliente). La nota sigue siendo SOLO para vos.
@@ -5194,6 +4580,10 @@ function detallePerdida(pf, mDogs, clients, ctx, from, to) {
     const mas = grupos.find(g => g.t === "mas");
     return { grupos, total: grupos.filter(g => g.t !== "mas").reduce((s, g) => s + g.total, 0), deMas: mas ? -mas.total : 0, neto: grupos.reduce((s, g) => s + g.total, 0) };
 }
+// adiestraPendientePeriodo: clases no cubiertas con fecha en [from..to] (saldo del período).
+function adiestraPendientePeriodo(series, from, to) {
+    return buildAdiestraPeriodo(series, from, to).pendiente;
+}
 // ╔══════════════════════════════════════════════════════════════════════════╗
 // ║  VENTAS DE ARTÍCULOS (23/10/2026) — módulo simple pedido por Matías:      ║
 // ║  artículos (nombre + precio) y ventas cobradas en el momento. SIN stock,  ║
@@ -5300,47 +4690,18 @@ function diasEntre(a, b) {
 // "elegí qué servicios ves") ya no van como carteles arriba de cada pestaña: son renglones de ese bloque,
 // todos a la vista, cada uno con su acción al tocarlo y una ✕ (servicios: no vuelve; backup: hasta mañana).
 // Los urgentes (no se pudo guardar / datos dañados) siguen arriba en todas las pestañas.
-// nube: invitación a guardar en la nube; nubeCf: otro celular guardó (va primero).
-// RECORDATORIO DE LA NUBE (20/11/2026, Matías: "estaría bueno que cada tanto te recuerde… sin que se torne una
-// molestia" → "Perfecto"). La ✕ (o tocarlo sin activarla) es "más tarde": vuelve a los 15, 30 y 60 días; la
-// 4.ª vez no vuelve más. cfg.avisoNube = {veces, hasta} o {veces:4, nunca:true}. El `true` viejo (la ✕ era
-// para siempre) se pasa UNA vez a {veces:1, hasta: hoy+15}: les vuelve a aparecer una sola vez y siguen el esquema.
-// Mientras se ve el de la nube, el del backup espera (no salen dos carteles de "guardá" juntos).
-const NUBE_AVISO_ESPERAS = [15, 30, 60];
-function nubeAvisoVisible(st, T) { if (!st)
-    return true; if (st === true || st.nunca)
-    return false; return !st.hasta || T >= st.hasta; }
-function nubeAvisoMasTarde(st, T) {
-    const v = (st && st !== true && Number(st.veces)) || 0;
-    const n = v + 1;
-    if (n > NUBE_AVISO_ESPERAS.length)
-        return { veces: n, nunca: true };
-    return { veces: n, hasta: addDays(T, NUBE_AVISO_ESPERAS[n - 1]) };
-}
-function nubeAvisoMigrar(st, T) { return st === true ? { veces: 1, hasta: addDays(T, NUBE_AVISO_ESPERAS[0]) } : st; }
-function nubeAvisoTexto(clientes, paseos) {
-    const c = Number(clientes) || 0, p = Number(paseos) || 0;
-    const tc = c + (c === 1 ? " cliente" : " clientes"), tp = p + (p === 1 ? " paseo" : " paseos");
-    return { t: c > 0 ? ("Tenés " + tc + (p > 0 ? (" y " + tp) : "") + " cargados") : "Guardá tus datos en la nube", d: "Si se te rompe o perdés el celular, con la nube no perdés nada" };
-}
-// ENTRAR DESDE OTRO CELULAR O LA COMPU (20/11/2026, usuaria G: "desde la página no tengo opción de log in"; Matías:
-// "el login hacelo"). En una app VACÍA (sin perros ni clientes) no había forma visible de entrar a la nube: el cartel
-// solo salía con perros cargados. Ahora: botón en la bienvenida y, si ya pasaste la bienvenida, este aviso.
-// Su ✕ es aparte (cfg.avisoNubeEntrar) y no gasta los "más tarde" del de guardar.
-function nubeEntrarTexto() { return { t: "¿Ya usás PaseoCan en otro celular?", d: "Entrá con tu mail y traé tus datos", entrar: true }; }
+// nube: invitación a guardar en la nube (una vez, con ✕); nubeCf: otro celular guardó (va primero).
 function avisosDeLaApp({ servicios, backup, shareMsg, primeros, nube, nubeCf }) {
     const out = [];
     if (nubeCf)
         out.push({ k: "nubecf", ic: "☁️", t: "Tu cuenta se guardó desde otro celular", d: "Tocá para elegir qué datos quedan. Mientras, no se sube nada.", tono: "amb" });
     if (primeros)
         out.push(primeros);
-    if (nube) {
-        const tx = nube === true ? nubeAvisoTexto(0, 0) : nube;
-        out.push({ k: "nube", ic: "☁️", t: tx.t, d: tx.d, tono: "grn", entrar: !!tx.entrar });
-    }
+    if (nube)
+        out.push({ k: "nube", ic: "☁️", t: "Guardá tus datos en la nube", d: "Si se te rompe o perdés el celular, entrás con tu mail y está todo", tono: "grn" });
     if (servicios)
         out.push({ k: "svc", ic: "🧩", t: "Nuevo: elegí qué servicios ves", d: "Escondé lo que no hacés, no se borra nada · tocá para elegir", tono: "grn" });
-    if (backup && !nube)
+    if (backup)
         out.push({ k: "bk", ic: "💾", t: backup.dias == null ? "Todavía no hiciste backup" : ("Hace " + backup.dias + " días sin backup"),
             d: shareMsg ? (shareMsg.err ? "No se pudo compartir · tocá para descargar el archivo" : shareMsg.txt) : "Tocá para guardar una copia", tono: "amb", descargar: !!(shareMsg && shareMsg.err) });
     return out;
@@ -9026,6 +8387,11 @@ function deshacerBaja(dogs, baja) {
 function seriesConSaldo(adiestramiento, mDogs, cid) {
     return (adiestramiento || []).map(ensureAdiestra).filter(a => a.estado !== "cancelada" && adiestraSaldo(a) > 0).filter(a => { const dog = (mDogs || []).find(d => d.id === a.dogId); return dog && dog.cid === cid; });
 }
+// estadiasDeClienteEnSemana: estadías no canceladas del cliente que tocan la semana wk (lo que
+// recorre Cobros → Estadías antes de aplicar su filtro).
+function estadiasDeClienteEnSemana(guarderias, mDogs, cid, wk) {
+    return (guarderias || []).map(ensureEstadia).filter(e => e.estado !== "cancelada" && (e.desde || "") <= wk.to && (e.hasta || "") >= wk.from).filter(e => { const dog = (mDogs || []).find(d => d.id === e.dogId); return dog && dog.cid === cid; });
+}
 // estadoCobroCliente: lo que muestra la ficha del cliente. paseos = lo mismo que su tarjeta en Cobros
 // esta semana (null si no tiene paseos); clases = lo pendiente de sus series (igual que Cobros → Clases).
 // ── quienTeDebe (26/10/2026, opción A de Matías) ──────────────────────────────
@@ -11911,7 +11277,6 @@ function Agenda({ svc, avisosApp, setWaTpl, partes, setPartes, paseos, setPaseos
                             React.createElement("div", { style: { flex: 1, minWidth: 0 } },
                                 React.createElement("div", { style: { fontWeight: 700, fontSize: 13, color: C.txt } }, x.ic + " " + x.t),
                                 x.d && React.createElement("div", { style: { fontSize: 12, color: x.col } }, x.d)),
-                            x.wa && React.createElement(WaBtn, { tit: "Aviso de vacuna", href: x.wa, size: 30 }),
                             x.cerrar && React.createElement("button", { className: "pc-aviso-cerrar", "aria-label": x.k === "bk" ? "Más tarde" : "No me interesa", onClick: e => { e.stopPropagation(); x.cerrar(); }, style: { background: "transparent", border: "none", color: C.mut, fontSize: 16, padding: "2px 6px", cursor: "pointer", flexShrink: 0 } }, "✕"))) }, false, x.go, null)),
                     avisosVac.length > 3 && React.createElement("button", { onClick: () => setVerVacTodos(v => !v), style: { background: "transparent", border: "none", color: C.mut, fontSize: 12, fontWeight: 700, cursor: "pointer", padding: "4px 0", textDecoration: "underline" } }, verVacTodos ? "Ver menos" : ("y " + (avisosVac.length - 3) + " vacunas más")))))));
     };
@@ -17324,7 +16689,7 @@ const ONB_COBRO = [
     { id: "paseo", titulo: "Por paseo", desc: "Un precio cada vez que paseás. Ej: $10k cada paseo." },
     { id: "mes", titulo: "Por mes", desc: "Abono mensual, sin importar cuántos paseos ni cancelaciones. Ej: $120k/mes." },
 ];
-function Onboarding({ onComplete, onSkip, onCreateGroup, onCreateClient, onServicios, onCobro, onYaUso }) {
+function Onboarding({ onComplete, onSkip, onCreateGroup, onCreateClient, onServicios, onCobro }) {
     const [step, setStep] = useState(0);
     const [svc, setSvc] = useState(null);
     const [tipoCobro, setTipoCobro] = useState(null);
@@ -17356,7 +16721,6 @@ function Onboarding({ onComplete, onSkip, onCreateGroup, onCreateClient, onServi
             React.createElement("div", { style: { fontSize: 28, fontWeight: 800, color: C.txt, marginBottom: 12 } }, "Bienvenido a PaseoCan"),
             React.createElement("div", { style: { fontSize: 15, color: C.mut, marginBottom: 32, lineHeight: 1.5 } }, "Vamos a dejarte armado en 4 pasos. Al terminar vas a tener tu primer cliente y perro listos."),
             React.createElement("button", { onClick: () => onServicios ? setSvc({ est: false, cla: false, ven: false, rut: false }) : setStep(1), style: Object.assign(Object.assign({}, BR("primario", false)), { width: "100%", fontSize: 15, padding: "14px 20px" }) }, "Empezar"),
-            onYaUso && React.createElement("button", { id: "pc-onb-yauso", onClick: onYaUso, style: { marginTop: 14, background: C.card, border: `1px solid ${C.grn}`, color: C.grn, borderRadius: 12, fontSize: 14, fontWeight: 700, cursor: "pointer", padding: "12px 16px", width: "100%", fontFamily: "inherit" } }, "☁️ ¿Ya usás PaseoCan? Entrá con tu mail"),
             React.createElement("button", { onClick: onSkip, style: { background: "transparent", border: "none", color: C.mut, marginTop: 10, fontSize: 13, cursor: "pointer", padding: 10 } }, "Saltar y configurar después"))),
         step === 1 && (React.createElement("div", { style: { flex: 1, display: "flex", flexDirection: "column" } },
             React.createElement(Progress, null),
@@ -17742,12 +17106,6 @@ function App() {
     const [waConf, setWaConf] = useState(false);
     const waRef = useRef(null);
     const [cfgRaw, setCfg] = usePersist("pc_config", DEFAULT_CFG);
-    // Recordatorio de la nube (20/11): el `true` viejo (✕ para siempre) pasa una vez a "vuelve en 15 días".
-    useEffect(() => {
-        if (cfgRaw && cfgRaw.avisoNube === true)
-            setCfg(c => (Object.assign(Object.assign({}, c), { avisoNube: nubeAvisoMigrar(c && c.avisoNube, T) })));
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [cfgRaw && cfgRaw.avisoNube]);
     const cfg = useMemo(() => (Object.assign(Object.assign({}, DEFAULT_CFG), (cfgRaw || {}))), [cfgRaw]);
     const svc = useMemo(() => serviciosActivos(cfg, { guarderias, adiestramiento, ventas, dogs }, T), [cfg, guarderias, adiestramiento, ventas, dogs, T]);
     // Tamaño de texto: aplica cfg.textScale como `zoom` sobre el <html>. Va sobre el
@@ -18231,9 +17589,7 @@ function App() {
         setGhostCleanupVersion(GHOST_CLEANUP_VERSION);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [ghostCleanupVersion]);
-    const nubeResetRef = useRef(null); // "Borrar todo" también sale de la nube: un celular en blanco no borra los datos del otro aparato
-    const doReset = () => { if (nubeResetRef.current)
-        nubeResetRef.current(); storage.clear(); setDogs(INIT_DOGS); setClients(INIT_CL); setRoutes([]); setGlobalRoute({ origin: "", destination: "", minPorKm: 15 }); setGG(INIT_GG); setPaseos(initPaseos(INIT_DOGS)); setAjustes({}); setAjPeriodo({}); setEdgeMemory({}); setEdgeMemMigrated(false); setEdgeLocMigrated(false); setRouteLugIdMigrated(false); setRutaGrupoMigrated(false); setConfReset(false); setTab("agenda"); };
+    const doReset = () => { storage.clear(); setDogs(INIT_DOGS); setClients(INIT_CL); setRoutes([]); setGlobalRoute({ origin: "", destination: "", minPorKm: 15 }); setGG(INIT_GG); setPaseos(initPaseos(INIT_DOGS)); setAjustes({}); setAjPeriodo({}); setEdgeMemory({}); setEdgeMemMigrated(false); setEdgeLocMigrated(false); setRouteLugIdMigrated(false); setRutaGrupoMigrated(false); setConfReset(false); setTab("agenda"); };
     const [ultimoBackup, setUltimoBackup] = usePersist("pc_last_backup", "");
     const [backupPospuesto, setBackupPospuesto] = usePersist("pc_backup_snooze", "");
     const [shareMsg, setShareMsg] = useState(null);
@@ -18767,120 +18123,7 @@ function App() {
             nubeGuardar(x => x ? Object.assign(Object.assign({}, x), { ses: s2 }) : x);
         return s2;
     };
-    // ── Sincronización entre aparatos (20/11/2026, DISEÑO_sincronizacion.md parte 2) ──
-    const nubeFetch = useMemo(() => nubeFetchCon(45000), []);
-    const nubeElegirRef = useRef(null);
-    nubeElegirRef.current = nubeElegir;
-    const syncModRef = useRef(null);
-    if (syncModRef.current === null)
-        syncModRef.current = storage.load("pc_sync_mod", {}) || {};
-    const syncBaseRef = useRef(undefined);
-    if (syncBaseRef.current === undefined)
-        syncBaseRef.current = storage.load("pc_sync_base", null);
-    const syncPrev = useRef(null), syncGen = useRef(0), syncToco = useRef(false), syncOtraVez = useRef(false), nubeUltimo = useRef(0), syncRef = useRef(null);
-    // Hasta que la persona toca algo, lo que cambia es la app sola (migraciones al abrir): se anota sin hora.
-    useEffect(() => {
-        const t = () => { syncToco.current = true; };
-        try {
-            window.addEventListener("pointerdown", t, true);
-            window.addEventListener("keydown", t, true);
-        }
-        catch (e) { }
-        return () => { try {
-            window.removeEventListener("pointerdown", t, true);
-            window.removeEventListener("keydown", t, true);
-        }
-        catch (e) { } };
-    }, []);
-    const syncGuardarMod = m => { syncModRef.current = m || {}; storage.save("pc_sync_mod", syncModRef.current); };
-    const syncBase = () => { const b = syncBaseRef.current, n = nubeRef.current; return b && b.datos && n && n.ses && b.uid === n.ses.uid ? b : null; };
-    const syncFijarBase = b => {
-        const n = nubeRef.current;
-        const x = b ? Object.assign(Object.assign({}, b), { uid: n && n.ses && n.ses.uid }) : null;
-        syncBaseRef.current = x;
-        if (!x || !storage.guardarSinAviso("pc_sync_base", x))
-            storage.remove("pc_sync_base");
-    };
-    // Anota qué cambió desde la última foto (y a qué hora). Devuelve true si hubo algo.
-    const syncRegistrar = () => {
-        const d = bkRef.current();
-        const p = syncPrev.current;
-        syncPrev.current = d;
-        if (!p || !nubeRef.current)
-            return false;
-        const m = syncModRef.current || {};
-        const m2 = registrarCambios(p, d, m, Date.now(), !syncToco.current);
-        if (!Object.keys(m2).some(k => m2[k] !== m[k]))
-            return false;
-        syncGuardarMod(m2);
-        syncGen.current++;
-        return true;
-    };
-    const SYNC_SET = { dogs: setDogs, clients: setClients, routes: setRoutes, globalRoute: setGlobalRoute, gg: setGG, paseos: setPaseos, guarderias: setGuarderias, adiestramiento: setAdiestramiento, articulos: setArticulos, ventas: setVentas, ajustes: setAjustes, congeladas: setCongeladas, ajPeriodo: setAjPeriodo, edgeMemory: setEdgeMemory, waTpl: setWaTpl, cfg: setCfg, partes: setPartes };
-    // Pone lo mezclado en la app SIN que cuente como cambio de este aparato (la foto pasa a ser lo mezclado).
-    const syncAplicar = (d, mod) => {
-        const act = bkRef.current();
-        Object.keys(SYNC_SET).forEach(k => { if (d[k] !== undefined && !syncIgual(act[k], d[k]))
-            SYNC_SET[k](d[k]); });
-        syncPrev.current = d;
-        syncGuardarMod(mod);
-    };
-    const nubeOk = (hora, cambio) => { const t = Date.now(); nubeGuardar(x => x ? Object.assign(Object.assign({}, x), { ultSync: Date.parse(hora || "") || t, ultSubida: cambio || !x.ultSubida ? t : x.ultSubida }) : x); setNubeEstado("ok"); };
-    // syncPreguntar: hay una pregunta "¿cuáles datos quedan?" sin contestar → no se sincroniza solo (si no, bajaría la
-    // fila entera cada minuto para volver a preguntar lo mismo). Se vuelve a mirar al tocar el aviso o "Guardar ahora".
-    const syncPreguntar = useRef(false);
-    const sincronizar = async (manual) => {
-        const n = nubeRef.current;
-        if (!n || !n.ses || !nubeEsLink || nubeElegirRef.current)
-            return;
-        if (syncPreguntar.current && !manual)
-            return;
-        if (nubeOcupado.current) {
-            syncOtraVez.current = true;
-            return;
-        }
-        let onl = true;
-        try {
-            onl = navigator.onLine;
-        }
-        catch (e) { }
-        if (!onl) {
-            setNubeEstado(e => e === "conflicto" ? e : "pendiente");
-            return;
-        }
-        nubeOcupado.current = true;
-        setNubeEstado(e => e === "pendiente" || e === "error" ? "subiendo" : e);
-        try {
-            const ses = await sesionViva();
-            if (!ses) {
-                setNubeEstado("error");
-                return;
-            }
-            const r = await nubeSincronizar({ fetchFn: nubeFetch, ses, inst: miInst(),
-                leer: () => { syncRegistrar(); return { datos: syncPrev.current, mod: syncModRef.current, gen: syncGen.current }; },
-                gen: () => { syncRegistrar(); return syncGen.current; },
-                base: syncBase, fijarBase: syncFijarBase, aplicar: syncAplicar, ultSync: () => nubeRef.current && nubeRef.current.ultSync, ahora: () => Date.now() });
-            syncPreguntar.current = r.estado === "elegir";
-            if (r.estado === "ok")
-                nubeOk(r.hora, r.subio || r.bajo);
-            else if (r.estado === "elegir")
-                setNubeEstado("conflicto");
-            else
-                setNubeEstado(r.estado);
-        }
-        finally {
-            nubeOcupado.current = false;
-            nubeUltimo.current = Date.now();
-            if (syncOtraVez.current) {
-                syncOtraVez.current = false;
-                setTimeout(() => { if (syncRef.current)
-                    syncRef.current(); }, 300);
-            }
-        }
-    };
-    syncRef.current = sincronizar;
-    // Subir TODO pisando la nube: solo cuando la persona eligió "Usar los de este celular".
-    const subirTodo = async () => {
+    const subirAhora = async (forzar) => {
         const n = nubeRef.current;
         if (nubeOcupado.current || !n || !n.ses)
             return;
@@ -18901,73 +18144,65 @@ function App() {
                 setNubeEstado("error");
                 return;
             }
-            syncRegistrar();
-            const d = syncPrev.current;
+            const inst = miInst();
+            if (!forzar) {
+                const m = await nubeLeer(fetch, ses, true);
+                if (!m.ok) {
+                    setNubeEstado("pendiente");
+                    return;
+                }
+                if (nubeConflicto(m.fila, inst, nubeRef.current.ultSync)) {
+                    setNubeEstado("conflicto");
+                    return;
+                }
+            }
             const iso = new Date().toISOString();
-            const r = await nubeSubirTodo(nubeFetch, ses, d, syncPodarTumbas(syncModRef.current, Date.now()), miInst(), iso);
+            const r = await nubeSubir(fetch, ses, bkRef.current(), inst, iso);
             if (r.ok) {
-                syncFijarBase({ datos: d, actualizado: r.actualizado });
-                nubeOk(r.actualizado, true);
+                const t = Date.parse(iso);
+                nubeGuardar(x => x ? Object.assign(Object.assign({}, x), { ultSync: t, ultSubida: t }) : x);
+                setNubeEstado("ok");
             }
             else
                 setNubeEstado(r.status === 0 ? "pendiente" : "error");
         }
         finally {
             nubeOcupado.current = false;
-            nubeUltimo.current = Date.now();
         }
     };
-    const subirAhora = forzar => forzar ? subirTodo() : sincronizar(true);
-    nubeResetRef.current = () => { syncPreguntar.current = false; clearTimeout(nubeTimer.current); nubeTimer.current = null; syncFijarBase(null); syncGuardarMod({}); syncPrev.current = null; nubeGuardar(null); setNubeEstado("ok"); };
-    // Recién entrado: si la nube está vacía, sube; si este celular está vacío, ofrece traer; si ya se sincronizaba con
-    // esta cuenta, o lo de arriba lo subió este mismo aparato, mezcla sola; si no (primera vez con datos en los dos),
-    // pregunta UNA vez cuáles valen. Nunca pisa sin preguntar.
+    // Recién entrado: si la nube está vacía, sube; si este celular está vacío, ofrece traer; si los dos
+    // tienen datos y la nube es de OTRO celular, pregunta cuáles valen. Nunca pisa sin preguntar.
     const nubeDespuesDeEntrar = async (ses) => {
-        syncPreguntar.current = false;
         nubeGuardar(x => (Object.assign(Object.assign({}, (x || {})), { email: ses.email || (x && x.email) || "", ses, ultSync: (x && x.ses && x.ses.uid === ses.uid) ? x.ultSync : null })));
         setNubeUI({ paso: "mail", email: "", codigo: "", msg: "", cargando: false });
-        const r = await nubeLeer(nubeFetch, ses, false);
+        const r = await nubeLeer(fetch, ses, false);
         if (!r.ok) {
             setNubeEstado("pendiente");
             return;
         }
         if (!r.fila) {
-            sincronizar(true);
+            subirAhora(true);
             return;
         }
-        if (!(dogs || []).length && !(clients || []).length) {
+        const n = r.fila.datos && r.fila.datos._nube;
+        if (!(dogs || []).length && !(clients || []).length)
             setNubeElegir({ tipo: "traer", fila: r.fila });
-            return;
-        }
-        if (syncBase() || !nubeConflicto(r.fila, miInst(), nubeRef.current && nubeRef.current.ultSync))
-            sincronizar(true);
+        else if (n && n.inst === miInst())
+            subirAhora(true);
         else
             setNubeElegir({ tipo: "elegir", fila: r.fila });
     };
     const nubeUsarNube = fila => {
-        const x = nubeDatosDeFila(fila);
-        let d;
-        try {
-            d = migrateBackup(x.datos);
-        }
-        catch (e) {
-            setNubeElegir(null);
-            setNubeEstado("error");
-            return;
-        }
-        aplicarBackup(d);
-        syncPrev.current = null; // lo que se trajo no es un cambio de este aparato: la próxima foto es el punto de partida
-        syncPreguntar.current = false;
-        syncGuardarMod(x.mod);
-        syncFijarBase({ datos: d, actualizado: fila.actualizado });
+        const _b = fila.datos || {}, { _nube } = _b, d = __rest(_b, ["_nube"]);
+        aplicarBackup(migrateBackup(d));
         const t = Date.parse(fila.actualizado || "") || Date.now();
-        nubeGuardar(y => y ? Object.assign(Object.assign({}, y), { ultSync: t, ultSubida: t }) : y);
+        nubeGuardar(x => x ? Object.assign(Object.assign({}, x), { ultSync: t }) : x);
         setNubeElegir(null);
         setNubeEstado("ok");
     };
-    const nubeUsarCelular = () => { setNubeElegir(null); nubeElegirRef.current = null; syncPreguntar.current = false; subirTodo(); };
+    const nubeUsarCelular = () => { setNubeElegir(null); subirAhora(true); };
     const nubeVerConflicto = async () => { const ses = await sesionViva(); if (!ses)
-        return; const r = await nubeLeer(nubeFetch, ses, false); if (r.ok && r.fila)
+        return; const r = await nubeLeer(fetch, ses, false); if (r.ok && r.fila)
         setNubeElegir({ tipo: "elegir", fila: r.fila }); };
     const nubePedir = async () => {
         const em = nubeUI.email.trim();
@@ -19005,56 +18240,61 @@ function App() {
         nubeDespuesDeEntrar(ses);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
-    // Al abrir: sincronizar (un momento después, para que las migraciones de arranque ya hayan corrido).
-    useEffect(() => { const t = setTimeout(() => { if (syncRef.current)
-        syncRef.current(); }, 1500); return () => clearTimeout(t); }, []);
-    // Cada cambio de datos: se anota (qué y cuándo) y se sincroniza unos segundos después del último.
+    // Al abrir: revisar si otro celular guardó después (sin subir nada).
     useEffect(() => {
-        const cambio = syncRegistrar();
+        (async () => {
+            const n = nubeRef.current;
+            if (!n || !n.ses || !nubeEsLink)
+                return;
+            let onl = true;
+            try {
+                onl = navigator.onLine;
+            }
+            catch (e) { }
+            if (!onl)
+                return;
+            const ses = await sesionViva();
+            if (!ses)
+                return;
+            const m = await nubeLeer(fetch, ses, true);
+            if (m.ok && nubeConflicto(m.fila, miInst(), nubeRef.current.ultSync))
+                setNubeEstado("conflicto");
+        })();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+    // Cada cambio de datos: sube 30 s después del último (si hay cuenta y no hay una pregunta abierta).
+    useEffect(() => {
         if (nubePrimera.current) {
             nubePrimera.current = false;
             return;
         }
-        if (!cambio || !nubeRef.current || !nubeRef.current.ses || nubeElegir)
+        if (!nubeRef.current || !nubeRef.current.ses || nubeElegir)
             return;
         setNubeEstado(e => e === "conflicto" ? e : "pendiente");
         clearTimeout(nubeTimer.current);
-        nubeTimer.current = setTimeout(() => { nubeTimer.current = null; if (syncRef.current)
-            syncRef.current(); }, NUBE_ESPERA_MS);
+        nubeTimer.current = setTimeout(() => { nubeTimer.current = null; subirAhora(false); }, NUBE_ESPERA_MS);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [dogs, clients, routes, globalRoute, gg, paseos, guarderias, adiestramiento, articulos, ventas, ajustes, congeladas, ajPeriodo, edgeMemory, waTpl, cfg, partes]);
-    // Vuelve la señal, la app vuelve a la pantalla (o se va con algo sin subir), o pasa un minuto a la vista: sincroniza.
+    // Vuelve la señal, o la app pasa a segundo plano con algo sin subir: se sube ya.
     useEffect(() => {
-        const ya = () => { if (!nubeRef.current || !nubeRef.current.ses)
-            return; clearTimeout(nubeTimer.current); nubeTimer.current = null; if (syncRef.current)
-            syncRef.current(); };
-        const vis = () => { try {
-            if (document.visibilityState === "hidden") {
-                if (nubeTimer.current)
-                    ya();
+        const alVolver = () => { if (nubeRef.current && nubeRef.current.ses)
+            subirAhora(false); };
+        const alOcultar = () => { try {
+            if (document.visibilityState === "hidden" && nubeTimer.current) {
+                clearTimeout(nubeTimer.current);
+                nubeTimer.current = null;
+                subirAhora(false);
             }
-            else
-                ya();
         }
         catch (e) { } };
-        const foco = () => { if (Date.now() - nubeUltimo.current > 2000)
-            ya(); }; // volver a la ventana: casi siempre llega junto con "visible"
-        const reloj = setInterval(() => { try {
-            if (document.visibilityState !== "visible")
-                return;
-        }
-        catch (e) { } if (Date.now() - nubeUltimo.current >= NUBE_MIRAR_MS)
-            ya(); }, 10000); // revisa cada 10 s si ya pasó el minuto desde la última vez
         try {
-            window.addEventListener("online", ya);
-            window.addEventListener("focus", foco);
-            document.addEventListener("visibilitychange", vis);
+            window.addEventListener("online", alVolver);
+            document.addEventListener("visibilitychange", alOcultar);
         }
         catch (e) { }
-        return () => { clearInterval(reloj); try {
-            window.removeEventListener("online", ya);
-            window.removeEventListener("focus", foco);
-            document.removeEventListener("visibilitychange", vis);
+        return () => { try {
+            window.removeEventListener("online", alVolver);
+            document.removeEventListener("visibilitychange", alOcultar);
         }
         catch (e) { } };
         // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -19143,13 +18383,13 @@ function App() {
     if (!onboardingDone)
         return (React.createElement(Onboarding, { onComplete: () => { setOnboardingDone(true); if (!(dogs || []).length)
                 setPrimeros({ inicio: T, cerrado: false }); }, onSkip: () => { setOnboardingDone(true); if (!(dogs || []).length)
-                setPrimeros({ inicio: T, cerrado: false }); }, onServicios: sv => setCfg(c => (Object.assign(Object.assign({}, c), { servicios: sv, avisoServicios: true }))), onCobro: op => setCfg(c => (Object.assign(Object.assign({}, c), { cobroInicial: op }))), onCreateGroup: ({ name, startTime, tipoCobro }) => { const g = { id: "gg_" + uid(), name, startTime, origin: "", destination: "", minPorKm: 15 }; setGG(gs => [...gs, g]); saveLS("pc_groups", [...gg, g]); }, onCreateClient: () => { setTab("clientes"); setAddCl(true); }, onYaUso: nubeEsLink ? () => { setOnboardingDone(true); setShowCfg(true); setCfgSecc("nube"); } : null }));
+                setPrimeros({ inicio: T, cerrado: false }); }, onServicios: sv => setCfg(c => (Object.assign(Object.assign({}, c), { servicios: sv, avisoServicios: true }))), onCobro: op => setCfg(c => (Object.assign(Object.assign({}, c), { cobroInicial: op }))), onCreateGroup: ({ name, startTime, tipoCobro }) => { const g = { id: "gg_" + uid(), name, startTime, origin: "", destination: "", minPorKm: 15 }; setGG(gs => [...gs, g]); saveLS("pc_groups", [...gg, g]); }, onCreateClient: () => { setTab("clientes"); setAddCl(true); } }));
     // Auditoría 09/11 (#3, #7): con Primeros pasos a la vista, el aviso de servicios ("Nuevo:", pensado para
     // usuarios viejos) y el de backup no se muestran: ya son pasos de la lista.
     const ppVisible = mostrarPrimeros(primeros, pasosPP);
     const avisoBk = avisoBackup(copia.fecha, backupPospuesto, T, (clients || []).length > 0 || (paseos || []).length > 0);
     const avisosApp = avisosDeLaApp({ servicios: !!(cfg && !cfg.servicios && !cfg.avisoServicios) && !primeros, backup: (avisoBk.mostrar && !ppVisible) ? avisoBk : null, shareMsg, primeros: avisoPrimeros(primeros, pasosPP, T),
-        nube: !nubeEsLink || (nube && nube.ses) ? null : ((dogs || []).length > 0 ? (nubeAvisoVisible(cfg && cfg.avisoNube, T) ? nubeAvisoTexto((clients || []).filter(c => !c.archivado).length, (paseos || []).filter(x => x && x.status === "completado").length) : null) : (!(clients || []).length && !(cfg && cfg.avisoNubeEntrar) ? nubeEntrarTexto() : null)), nubeCf: nubeEstado === "conflicto" && !!(nube && nube.ses) }).map(a => (Object.assign(Object.assign({}, a), { col: a.tono === "grn" ? C.grn : C.amb, go: a.k === "nubecf" ? nubeVerConflicto : a.k === "nube" && a.entrar ? () => { setShowCfg(true); setCfgSecc("nube"); } : a.k === "nube" ? () => { setCfg(c => (Object.assign(Object.assign({}, c), { avisoNube: nubeAvisoMasTarde(c && c.avisoNube, T) }))); setShowCfg(true); setCfgSecc("nube"); } : a.k === "pp" ? () => setPrimeros(p => (Object.assign(Object.assign({}, (p || { inicio: T })), { cerrado: false }))) : a.k === "svc" ? () => { setCfg(c => (Object.assign(Object.assign({}, c), { avisoServicios: true }))); setShowCfg(true); setCfgSecc("servicios"); } : (a.descargar ? () => { doExport(); setShareMsg(null); } : compartirBackup), cerrar: a.k === "nubecf" ? nubeVerConflicto : a.k === "nube" && a.entrar ? () => setCfg(c => (Object.assign(Object.assign({}, c), { avisoNubeEntrar: true }))) : a.k === "nube" ? () => setCfg(c => (Object.assign(Object.assign({}, c), { avisoNube: nubeAvisoMasTarde(c && c.avisoNube, T) }))) : a.k === "pp" ? () => setPrimeros(p => (Object.assign(Object.assign({}, (p || {})), { avisoVisto: true }))) : a.k === "svc" ? () => setCfg(c => (Object.assign(Object.assign({}, c), { avisoServicios: true }))) : () => { setBackupPospuesto(T); setShareMsg(null); } })));
+        nube: nubeEsLink && !(nube && nube.ses) && !(cfg && cfg.avisoNube) && ((dogs || []).length > 0), nubeCf: nubeEstado === "conflicto" && !!(nube && nube.ses) }).map(a => (Object.assign(Object.assign({}, a), { col: a.tono === "grn" ? C.grn : C.amb, go: a.k === "nubecf" ? nubeVerConflicto : a.k === "nube" ? () => { setCfg(c => (Object.assign(Object.assign({}, c), { avisoNube: true }))); setShowCfg(true); setCfgSecc("nube"); } : a.k === "pp" ? () => setPrimeros(p => (Object.assign(Object.assign({}, (p || { inicio: T })), { cerrado: false }))) : a.k === "svc" ? () => { setCfg(c => (Object.assign(Object.assign({}, c), { avisoServicios: true }))); setShowCfg(true); setCfgSecc("servicios"); } : (a.descargar ? () => { doExport(); setShareMsg(null); } : compartirBackup), cerrar: a.k === "nubecf" ? nubeVerConflicto : a.k === "nube" ? () => setCfg(c => (Object.assign(Object.assign({}, c), { avisoNube: true }))) : a.k === "pp" ? () => setPrimeros(p => (Object.assign(Object.assign({}, (p || {})), { avisoVisto: true }))) : a.k === "svc" ? () => setCfg(c => (Object.assign(Object.assign({}, c), { avisoServicios: true }))) : () => { setBackupPospuesto(T); setShareMsg(null); } })));
     return (React.createElement(SvcCtx.Provider, { value: svc },
         React.createElement("div", { style: { fontFamily: "'Segoe UI',system-ui,sans-serif", background: C.bg, minHeight: "100vh", maxWidth: 480, margin: "0 auto", color: C.txt } },
             origenViejo && !mudado && destinoVivo && React.createElement("div", { id: "pc-mudanza-cartel", style: { background: C.grn + "22", borderBottom: `1px solid ${C.grn}`, padding: "12px 16px" } },
@@ -19339,7 +18579,7 @@ function App() {
                                         nubeVerConflicto();
                                     else
                                         subirAhora(false); }, style: Object.assign(Object.assign({}, BR("secundario", false)), { width: "100%" }) }, nubeEstado === "conflicto" ? "Elegir qué datos quedan" : "Guardar ahora"),
-                                React.createElement("button", { id: "pc-nube-salir", onClick: () => { syncPreguntar.current = false; clearTimeout(nubeTimer.current); nubeTimer.current = null; syncFijarBase(null); nubeGuardar(null); setNubeEstado("ok"); }, style: { background: "transparent", border: "none", color: C.mut, fontSize: 13, fontWeight: 700, padding: "10px 0 0", cursor: "pointer", width: "100%", fontFamily: "inherit" } }, "Salir de la cuenta (tus datos quedan en este celular)"))) : nubeUI.paso === "codigo" ? (React.createElement(React.Fragment, null,
+                                React.createElement("button", { id: "pc-nube-salir", onClick: () => { nubeGuardar(null); setNubeEstado("ok"); }, style: { background: "transparent", border: "none", color: C.mut, fontSize: 13, fontWeight: 700, padding: "10px 0 0", cursor: "pointer", width: "100%", fontFamily: "inherit" } }, "Salir de la cuenta (tus datos quedan en este celular)"))) : nubeUI.paso === "codigo" ? (React.createElement(React.Fragment, null,
                                 React.createElement("div", { style: { fontSize: 13, color: C.txt, lineHeight: 1.5 } },
                                     "Te mandamos un mail a ",
                                     React.createElement("b", null, nubeUI.email),
