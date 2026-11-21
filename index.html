@@ -996,6 +996,17 @@ const addMin = (t, m) => { const [h, mm] = t.split(":").map(Number), tot = h * 6
 // Se recuerda por fecha (28/10/2026, velocidad: se llama miles de veces al abrir Stats). Devuelve
 // siempre un objeto NUEVO, así nadie puede cambiar el guardado.
 const _wkCache = new Map();
+// Título de una semana/mes de "De antes" en Cobros (21c): "Semana del 1/11", con el año solo
+// si no es el de hoy ("Semana del 28/12/2025"). Mensual: "Noviembre" / "Diciembre 2025".
+function etiquetaDeAntes(h, hoy) {
+    const f = (h && h.wkFrom) || "";
+    if (f.length < 10)
+        return f;
+    const anio = f.slice(0, 4), otroAnio = anio !== (hoy || td()).slice(0, 4);
+    if (h.esMensual)
+        return MONTHS[Number(f.slice(5, 7)) - 1] + (otroAnio ? " " + anio : "");
+    return "Semana del " + Number(f.slice(8, 10)) + "/" + Number(f.slice(5, 7)) + (otroAnio ? "/" + anio : "");
+}
 function wkRange(s) {
     let r = _wkCache.get(s);
     if (!r) {
@@ -2364,9 +2375,10 @@ function nombreDato(k) { return NOMBRE_DATO[k] || k; }
 // HTML: la base solo deja hacer lo que permiten sus reglas (RLS). NUNCA poner acá la secret/service_role.
 const SUPA_URL = "https://zwuakvfsgesdeiioimcj.supabase.co";
 const SUPA_KEY = "sb_publishable_aIkR9AH_aUigZVcm_eNlKQ_1eMtomWx";
-const APP_VER = "2026-11-21b";
+const APP_VER = "2026-11-21g";
 // Contador anónimo (Matías: "¿vamos a saber cuánta gente la está usando?"): una vez por día que se abre
-// la app, manda SOLO un número al azar de este celular + la versión. Sin nombre, mail ni datos. La
+// la app, manda un número al azar de este celular + la versión (desde el 21/11 también % de espacio, rango de
+// paseos y si usa la nube: ver usoParaContar). Sin nombre, mail ni datos de clientes o plata. La
 // tabla `aperturas` solo deja anotar (nadie la lee desde la app). Se apaga en Configuración > Privacidad.
 // No cuenta desde un archivo (verificador) ni sin señal.
 function debeContar({ off, ultimo, hoy, protocolo, online }) { return !off && protocolo === "https:" && online !== false && ultimo !== hoy; }
@@ -2382,9 +2394,18 @@ function nuevoInst() {
         r += Math.random().toString(36).slice(2);
     return r.slice(0, 24);
 }
-async function contarApertura(fetchFn, { url, key, inst, ver }) {
+// Tamaño de uso (21/11/2026, Matías: "Agregá la medición"): para saber CUÁNDO hace falta mudar los datos a IndexedDB
+// o acelerar "lo de antes", el contador suma 3 números: % de espacio usado, cuántos paseos EN RANGOS (no el número
+// exacto) y si usa la nube (la nube guarda una copia más: ocupa el doble). Nada de nombres, clientes ni plata.
+function rangoPaseos(n) { n = Number(n) || 0; return n <= 0 ? "0" : n < 100 ? "1-99" : n < 1000 ? "100-999" : n < 3000 ? "1000-2999" : n < 5000 ? "3000-4999" : "5000+"; }
+function usoParaContar({ usado, limite, paseos, nube }) { return { esp: espacioPct(usado, limite), pas: rangoPaseos(paseos), nube: !!nube }; }
+async function contarApertura(fetchFn, { url, key, inst, ver, uso }) {
+    const mandar = async (body) => fetchFn(url + "/rest/v1/aperturas", { method: "POST", headers: { apikey: key, "Content-Type": "application/json", Prefer: "return=minimal" }, body: JSON.stringify(body) });
     try {
-        const r = await fetchFn(url + "/rest/v1/aperturas", { method: "POST", headers: { apikey: key, "Content-Type": "application/json", Prefer: "return=minimal" }, body: JSON.stringify({ inst, ver }) });
+        let r = await mandar(uso ? Object.assign({ inst, ver }, uso) : { inst, ver });
+        // 400 = la tabla todavía no tiene las columnas nuevas (esp, pas, nube): se cuenta igual, como antes.
+        if (uso && r && r.status === 400)
+            r = await mandar({ inst, ver });
         return !!r && (r.ok || r.status === 409);
     } // 409 = ya contado hoy (otro día del servidor)
     catch (e) {
@@ -2979,7 +3000,6 @@ function syncSacarDobles(lista, esAuto, clave, trabajado, baseIds, mod) {
     }
     return { lista: lista.filter(p => !fuera.has(p && p.id)), quitados: [...fuera] };
 }
-function syncSacarPaseosDobles(paseos, baseIds, mod) { const r = syncSacarDobles(paseos, syncPaseoAuto, syncClavePaseo, syncPaseoTrabajado, baseIds, mod); return { paseos: r.lista, quitados: r.quitados }; }
 // Lo que borra la app en cascada (cliente → perros → paseos) se respeta después de mezclar; si del otro lado se
 // trabajó algo después del borrado, vuelve el padre (no se pierde plata).
 function syncCascada(datos, mod, mio, nube, base, modMio, modNube) {
@@ -2992,7 +3012,11 @@ function syncCascada(datos, mod, mio, nube, base, modMio, modNube) {
             return tn > tm ? xn : xm;
         return xm || xn || en(base);
     };
-    const revividos = { dogs: [], clients: [] }, caidos = { dogs: [], paseos: [] };
+    const revividos = { dogs: [], clients: [] }, caidos = { dogs: [], paseos: [], guarderias: [], adiestramiento: [] };
+    // Estadías y clases de un perro (21d, BUG-101): siguen la misma regla que sus paseos. Una estadía que armó la app
+    // sola (jornada de una serie) sin tocar no revive a nadie; una cargada a mano o trabajada, y una serie de clases, sí.
+    const SERV = ["guarderias", "adiestramiento"];
+    const servTrab = (col, x) => !!x && (col === "guarderias" ? (syncEstadiaTrabajada(x) || !syncEstadiaAuto(x)) : true);
     // 1) paseos de perros borrados
     let dogIds = new Set((d.dogs || []).map(x => x.id));
     const mDogs = md.dogs || {}, mPas = md.paseos || {};
@@ -3002,6 +3026,15 @@ function syncCascada(datos, mod, mio, nube, base, modMio, modNube) {
             return;
         if (syncPaseoTrabajado(p) && syncT(mPas, p.id) > syncT(mDogs, p.dogId))
             reviveDog.set(p.dogId, Math.max(reviveDog.get(p.dogId) || 0, syncT(mPas, p.id)));
+    });
+    SERV.forEach(col => {
+        const mc = md[col] || {};
+        (d[col] || []).forEach(x => {
+            if (!x || dogIds.has(x.dogId) || !syncBorrado(mDogs, x.dogId))
+                return;
+            if (servTrab(col, x) && syncT(mc, x.id) > syncT(mDogs, x.dogId))
+                reviveDog.set(x.dogId, Math.max(reviveDog.get(x.dogId) || 0, syncT(mc, x.id)));
+        });
     });
     if (reviveDog.size) {
         const nd = (d.dogs || []).slice();
@@ -3066,6 +3099,22 @@ function syncCascada(datos, mod, mio, nube, base, modMio, modNube) {
         return false;
     });
     md.paseos = npm;
+    // 4) estadías y clases que quedaron sin perro por un borrado: se van, como al eliminar el perro en la app
+    SERV.forEach(col => {
+        if (!Array.isArray(d[col]))
+            return;
+        const nm = Object.assign({}, (md[col] || {}));
+        d[col] = d[col].filter(x => {
+            if (!x || dogIds.has(x.dogId) || !syncBorrado(mD2, x.dogId))
+                return true;
+            if (servTrab(col, x) && syncT(nm, x.id) > syncT(mD2, x.dogId))
+                return true; // no debería pasar (revivió), por las dudas no se tira
+            nm[x.id] = { b: syncT(mD2, x.dogId) };
+            caidos[col].push(x.id);
+            return false;
+        });
+        md[col] = nm;
+    });
     return { datos: d, mod: md, revividos, caidos };
 }
 // Tumbas viejas se olvidan (si un aparato no se conecta en 4 meses, se le pregunta como la primera vez).
@@ -3189,6 +3238,130 @@ function nubeDatosDeFila(fila) {
     const d = (fila && fila.datos) || {};
     const { _nube, _sync } = d, datos = __rest(d, ["_nube", "_sync"]);
     return { datos, mod: _sync && syncEsObj(_sync.mod) ? _sync.mod : {} };
+}
+// ═══ IndexedDB — etapa 1 (21/11/2026, Matías: "Dale. Con todo el cuidado pertinente") ═══
+// La copia de la nube (pc_sync_base, la "base" para mezclar) era la mitad del espacio de quien usa la nube. Pasa a
+// IndexedDB (otro depósito del navegador, con mucho más lugar). Reglas de cuidado:
+//  · todo con tiempo límite y sin tirar errores: si IndexedDB no anda, se sigue EXACTAMENTE como antes (localStorage);
+//  · la copia vieja se borra recién después de leer la nueva y comprobar que es igual;
+//  · la sincronización espera a que la base termine de cargar (si no, la vería vacía y preguntaría sin motivo).
+// Perder la base nunca pierde datos: la próxima vez pregunta "¿cuáles datos valen?", como la primera vez.
+const IDB_NOMBRE = "paseocan", IDB_ALMACEN = "kv", IDB_BASE = "pc_sync_base";
+// Temporizador (se puede cambiar en los tests). Si IndexedDB no contesta en 4 s, se toma como que no anda.
+const IDB_TM = { set: (f, ms) => { try {
+        return setTimeout(f, ms);
+    }
+    catch (e) {
+        return null;
+    } }, clear: t => { try {
+        clearTimeout(t);
+    }
+    catch (e) { } } };
+function idbAbrir(fac, ms, tm) {
+    const T = tm || IDB_TM;
+    return new Promise(res => {
+        let listo = false;
+        const fin = v => { if (!listo) {
+            listo = true;
+            res(v);
+        } };
+        const t = T.set(() => fin(null), ms || 4000);
+        try {
+            const f = fac || (typeof indexedDB !== "undefined" ? indexedDB : null);
+            if (!f) {
+                T.clear(t);
+                fin(null);
+                return;
+            }
+            const rq = f.open(IDB_NOMBRE, 1);
+            rq.onupgradeneeded = () => { try {
+                const db = rq.result;
+                if (!db.objectStoreNames.contains(IDB_ALMACEN))
+                    db.createObjectStore(IDB_ALMACEN);
+            }
+            catch (e) { } };
+            rq.onsuccess = () => { T.clear(t); fin(rq.result); };
+            rq.onerror = () => { T.clear(t); fin(null); };
+        }
+        catch (e) {
+            T.clear(t);
+            fin(null);
+        }
+    });
+}
+function idbPedido(db, modo, fn, ms, tm) {
+    const T = tm || IDB_TM;
+    return new Promise(res => {
+        let listo = false;
+        const fin = v => { if (!listo) {
+            listo = true;
+            res(v);
+        } };
+        const t = T.set(() => fin({ ok: false }), ms || 4000);
+        try {
+            const tx = db.transaction(IDB_ALMACEN, modo);
+            const rq = fn(tx.objectStore(IDB_ALMACEN));
+            let val;
+            rq.onsuccess = () => { val = rq.result; };
+            tx.oncomplete = () => { T.clear(t); fin({ ok: true, val }); };
+            tx.onerror = () => { T.clear(t); fin({ ok: false }); };
+            tx.onabort = () => { T.clear(t); fin({ ok: false }); };
+        }
+        catch (e) {
+            T.clear(t);
+            fin({ ok: false });
+        }
+    });
+}
+const idbLeer = (db, k) => db ? idbPedido(db, "readonly", st => st.get(k)) : Promise.resolve({ ok: false });
+const idbGuardar = (db, k, v) => db ? idbPedido(db, "readwrite", st => st.put(v, k)) : Promise.resolve({ ok: false });
+const idbBorrar = (db, k) => db ? idbPedido(db, "readwrite", st => st.delete(k)) : Promise.resolve({ ok: false });
+// Guarda en IndexedDB y lo vuelve a leer: true solo si quedó igual.
+async function idbGuardarVerificado(db, k, v) { const g = await idbGuardar(db, k, v); if (!g.ok)
+    return false; const r = await idbLeer(db, k); return r.ok && syncIgual(r.val, v); }
+const horaBase = b => (b && Date.parse(b.actualizado || "")) || 0;
+// Al abrir: de dónde sale la base y si de ahora en más vive en IndexedDB. leerLS/borrarLS = la copia vieja.
+async function cargarBaseSync({ db, leerLS, borrarLS }) {
+    let vieja = null;
+    try {
+        vieja = leerLS();
+    }
+    catch (e) { }
+    if (!db)
+        return { base: vieja, enIdb: false };
+    const r = await idbLeer(db, IDB_BASE);
+    if (!r.ok)
+        return { base: vieja, enIdb: false };
+    const nueva = r.val && r.val.datos ? r.val : null;
+    if (!vieja)
+        return { base: nueva, enIdb: true };
+    // Hay copia vieja: la mudanza no terminó, o en algún momento IndexedDB falló y se volvió a guardar en el lugar viejo.
+    // Vale la más nueva (por la hora de la nube); si es la vieja, se copia a IndexedDB y se comprueba antes de borrarla.
+    if (nueva && horaBase(nueva) >= horaBase(vieja)) {
+        borrarLS();
+        return { base: nueva, enIdb: true };
+    }
+    if (await idbGuardarVerificado(db, IDB_BASE, vieja)) {
+        borrarLS();
+        return { base: vieja, enIdb: true };
+    }
+    await idbBorrar(db, IDB_BASE);
+    return { base: vieja, enIdb: false };
+}
+// Cada vez que la base cambia. Devuelve si sigue en IndexedDB. Si IndexedDB falla, hace lo de antes (localStorage) y
+// borra la copia de IndexedDB, para que al abrir no se tome una base vieja.
+async function guardarBaseSync({ db, enIdb, base, guardarLS, borrarLS }) {
+    if (enIdb && db) {
+        const r = base ? await idbGuardar(db, IDB_BASE, base) : await idbBorrar(db, IDB_BASE);
+        if (r.ok) {
+            borrarLS();
+            return true;
+        }
+        await idbBorrar(db, IDB_BASE);
+    }
+    if (!base || !guardarLS(base))
+        borrarLS();
+    return false;
 }
 // ¿Los mismos datos? Sin mirar la hora del backup, la versión ni las marcas de la nube.
 function syncMismosDatos(a, b) {
@@ -3413,6 +3586,16 @@ const storage = {
         }
         catch (_b) { }
         return out;
+    },
+    // Cuánto ocupa PaseoCan en este celular (caracteres: clave + valor de TODO lo guardado, también la copia de la
+    // nube). Se compara con LIMITE_ESPACIO (revisión de estabilidad, hallazgo 2a).
+    tamano() {
+        let t = 0;
+        try {
+            this.todas().forEach(k => { const v = localStorage.getItem(k); t += k.length + (v ? v.length : 0); });
+        }
+        catch (_b) { }
+        return t;
     },
     keys() {
         return Object.values(STORAGE_KEYS);
@@ -3649,6 +3832,10 @@ function ensureDogCuidados(dog) {
 //   -> "realizada" (confirmada con un toque) | "cancelada" (no cuenta, reactivable). Las estadias
 //   viejas del backup (sin estado) migran a "realizada": nada de lo cargado cambia de cuenta.
 // recurId/moved/origDesde (si existen) viajan en el spread; son de las ocurrencias recurrentes.
+// pagosDe (21e, revisión de estabilidad, hallazgo 3): la ÚNICA forma de leer los pagos de una estadía o serie de clases.
+// Si el dato está dañado (no es una lista: texto, número, objeto) da una lista vacía, en vez de tirar abajo la app
+// (antes "x".reduce → pantalla de error). Un pago suelto dañado (null, texto) se descarta. Con datos sanos devuelve la MISMA lista (no copia).
+function pagosDe(x) { const l = x && Array.isArray(x.pagos) ? x.pagos : []; return l.every(p => p && typeof p === "object") ? l : l.filter(p => p && typeof p === "object"); }
 function ensureEstadia(e) {
     if (!e)
         return e;
@@ -3663,6 +3850,9 @@ function ensureEstadia(e) {
         const { fecha } = e, rest = __rest(e, ["fecha"]);
         n = Object.assign(Object.assign({}, rest), { desde: f, hasta: f, dadas });
     }
+    // Pagos dañados (no es una lista): se leen como sin pagos (21e, revisión de estabilidad, hallazgo 3).
+    if (n.pagos !== undefined && pagosDe(n) !== n.pagos)
+        n = Object.assign(Object.assign({}, n), { pagos: pagosDe(n) });
     return n.estado ? n : Object.assign(Object.assign({}, n), { estado: "realizada" });
 }
 // editEstadia: aplica cambios de fechas/horarios/precio a una estadia, PRESERVANDO
@@ -3689,7 +3879,7 @@ function cancelEstadia(e, senaRetenida, fechaCancel) { const b = ensureEstadia(e
 // "¿Borrar estadía?" la borraba y lo cobrado desaparecía de "Ya cobraste" sin aviso. Pura.
 function plataAlBorrar(lista) {
     const xs = (lista || []).filter(Boolean);
-    const pag = xs.reduce((s, x) => s + (x.pagos ? (x.pagos || []).reduce((t, p) => t + (Number(p && p.monto) || 0), 0) : 0), 0);
+    const pag = xs.reduce((s, x) => s + pagosDe(x).reduce((t, p) => t + (Number(p && p.monto) || 0), 0), 0);
     return { pagado: Math.max(0, pag), realizada: xs.some(x => x.estado === "realizada") };
 }
 // borrarSerieQuedandoPlata: "esta y las siguientes" pero las que tienen plata quedan canceladas con la
@@ -3782,7 +3972,7 @@ function makeEstadias(tpl, existing, horizonDias) {
 //    lo ya hecho conserva lo que valía.
 function setGuarderiasSerie(gs, tpl, dogId, corte, precioDesde, horizonDias) {
     const arr = Array.isArray(gs) ? gs : [];
-    const conservar = e => ((e.pagos || []).length > 0) || !!e.moved;
+    const conservar = e => pagosDe(e).length > 0 || !!e.moved;
     const kept = arr.filter(e => !(e.dogId === dogId && e.recurId && e.estado === "programada" && (e.desde || "") >= corte && !conservar(e)));
     const kept2 = precioDesde ? kept.map(e => (e.dogId === dogId && e.recurId === tpl.id && e.estado === "programada" && (e.desde || "") >= precioDesde) ? Object.assign(Object.assign({}, e), { precio: precioVigenteEn(tpl.historialPrecios, tpl.precio, e.desde) }) : e) : kept;
     return [...kept2, ...makeEstadias(tpl, kept2, horizonDias)];
@@ -3801,7 +3991,7 @@ function estadiaTotal(e) {
     return units * (Number(e.precio) || 0);
 }
 function estadiaPagado(e) {
-    return ((e && e.pagos) || []).reduce((s, p) => s + (Number(p && p.monto) || 0), 0);
+    return pagosDe(e).reduce((s, p) => s + (Number(p && p.monto) || 0), 0);
 }
 // Descuento de la estadía (30/10/2026, Matías: "un solo campo de ajuste y elegir a qué corresponde"):
 // e.descuento (≥0) es plata que NO se va a cobrar de esa estadía: baja el saldo y va a "Perdiste"
@@ -3842,7 +4032,7 @@ function resolverPagoDeMas(e, decision, fecha) {
     if (!(exc > 0))
         return base;
     if (decision === "devuelvo")
-        return Object.assign(Object.assign({}, base), { pagos: [...(base.pagos || []), { id: uid(), fecha: fecha || "", monto: -exc, tipo: "devolucion" }] });
+        return Object.assign(Object.assign({}, base), { pagos: [...pagosDe(base), { id: uid(), fecha: fecha || "", monto: -exc, tipo: "devolucion" }] });
     if (decision === "quedo") {
         const d = Math.min(estadiaDescuento(base), exc);
         exc -= d;
@@ -3925,7 +4115,8 @@ function estPendientePeriodo(guarderias, from, to) {
 function senasRecibidasDetalle(guarderias, from, to) {
     return (guarderias || []).map(ensureEstadia)
         .filter(e => e.estado === "programada")
-        .map(e => ({ dogId: e.dogId, desde: e.desde, hasta: e.hasta, monto: (e.pagos || []).filter(p => { const f = p.fecha || ""; return f >= from && f <= to; }).reduce((a, p) => a + (p.monto || 0), 0) }))
+        .map(e => ({ dogId: e.dogId, desde: e.desde, hasta: e.hasta, monto: pagosDe(e).filter(p => { if (!p)
+            return false; const f = p.fecha || ""; return f >= from && f <= to; }).reduce((a, p) => a + (p.monto || 0), 0) }))
         .filter(x => x.monto > 0);
 }
 function senasRecibidas(guarderias, from, to) {
@@ -3946,7 +4137,7 @@ function registrarPagoEstadia(e, monto, tipo, fecha, demas) {
         return base;
     const pago = { id: uid(), fecha: fecha || "", monto: m, tipo: (tipo === "adelanto" || tipo === "saldo") ? tipo : "saldo" };
     let exc = Math.max(0, m - estadiaSaldo(base));
-    const out = Object.assign(Object.assign({}, base), { pagos: [...(base.pagos || []), pago] });
+    const out = Object.assign(Object.assign({}, base), { pagos: [...pagosDe(base), pago] });
     if (exc > 0) {
         const d = Math.min(estadiaDescuento(base), exc);
         exc -= d;
@@ -4162,7 +4353,7 @@ function ensureAdiestra(a) {
         return a;
     const sched = Array.isArray(a.schedule) ? a.schedule.map(Number) : [];
     const ncRaw = Math.max(0, Math.floor(Number(a.nClases) || 0));
-    return Object.assign(Object.assign({}, a), { schedule: sched, desde: a.desde || "", horaDesde: a.horaDesde || "", horaHasta: a.horaHasta || "", nClases: ncRaw > 0 ? ncRaw : (sched.length === 0 ? 1 : 0), precio: Number(a.precio) || 0, estado: a.estado === "cancelada" ? "cancelada" : "activa", pagos: Array.isArray(a.pagos) ? a.pagos : [], clases: (a.clases && typeof a.clases === "object" && !Array.isArray(a.clases)) ? a.clases : {}, movidas: (a.movidas && typeof a.movidas === "object" && !Array.isArray(a.movidas)) ? a.movidas : {}, omitidas: (a.omitidas && typeof a.omitidas === "object" && !Array.isArray(a.omitidas)) ? a.omitidas : {}, historialPrecios: Array.isArray(a.historialPrecios) ? a.historialPrecios.filter(t => t && t.desde) : [], notas: a.notas || "", objetivo: a.objetivo || "" });
+    return Object.assign(Object.assign({}, a), { schedule: sched, desde: a.desde || "", horaDesde: a.horaDesde || "", horaHasta: a.horaHasta || "", nClases: ncRaw > 0 ? ncRaw : (sched.length === 0 ? 1 : 0), precio: Number(a.precio) || 0, estado: a.estado === "cancelada" ? "cancelada" : "activa", pagos: pagosDe(a), clases: (a.clases && typeof a.clases === "object" && !Array.isArray(a.clases)) ? a.clases : {}, movidas: (a.movidas && typeof a.movidas === "object" && !Array.isArray(a.movidas)) ? a.movidas : {}, omitidas: (a.omitidas && typeof a.omitidas === "object" && !Array.isArray(a.omitidas)) ? a.omitidas : {}, historialPrecios: Array.isArray(a.historialPrecios) ? a.historialPrecios.filter(t => t && t.desde) : [], notas: a.notas || "", objetivo: a.objetivo || "" });
 }
 // ── Precio por fecha (clases y plantilla de guardería). Un cambio de precio NO pisa lo
 // anterior: se agrega un tramo {desde,monto}. Cada fecha cobra el tramo vigente ese día.
@@ -4370,7 +4561,7 @@ function restaurarClase(a, fechaMostrada) {
 function adiestraNClases(a) { return adiestraFechas(a).length; }
 // adiestraTotal: suma del precio vigente en la fecha de cada clase (sin historial = nClases × precio).
 function adiestraTotal(a) { const b = ensureAdiestra(a || {}); return adiestraFechas(b).reduce((s, f) => s + precioAdiestraEn(b, f), 0); }
-function adiestraPagado(a) { return ((a && a.pagos) || []).reduce((s, p) => s + (Number(p && p.monto) || 0), 0); }
+function adiestraPagado(a) { return pagosDe(a).reduce((s, p) => s + (Number(p && p.monto) || 0), 0); }
 // Descuento de la serie de clases (30/10/2026): igual que en estadías. Cubre clases como un pago
 // (después de lo pagado, en orden) pero no es plata cobrada: va a "Perdiste".
 function adiestraDescuento(a) { return Math.max(0, Number(a && a.descuento) || 0); }
@@ -4560,7 +4751,7 @@ function registrarPagoAdiestra(a, monto, fecha) {
     const m = Math.max(0, Math.min(Number(monto) || 0, adiestraSaldo(base)));
     if (m <= 0)
         return base;
-    return Object.assign(Object.assign({}, base), { pagos: [...(base.pagos || []), { id: uid(), fecha: fecha || "", monto: m }] });
+    return Object.assign(Object.assign({}, base), { pagos: [...pagosDe(base), { id: uid(), fecha: fecha || "", monto: m }] });
 }
 // ── Alta de clases más rápida (26/10/2026, dibujo aprobado por Matías) ──
 // sumarHora("15:30",60) → "16:30". Sin hora: "".
@@ -4723,7 +4914,7 @@ function buildAdiestraPeriodo(series, from, to) {
             const canj = (a.canceladaEn || "");
             const pag = adiestraPagado(a);
             if (cajaSemana) {
-                (a.pagos || []).forEach(pg => { const fp = (pg && pg.fecha) || a.desde || ""; if (fp >= from && fp <= to) {
+                pagosDe(a).forEach(pg => { const fp = (pg && pg.fecha) || a.desde || ""; if (fp >= from && fp <= to) {
                     const m = Number(pg && pg.monto) || 0;
                     cobrado += m;
                     potencial += m;
@@ -4744,7 +4935,7 @@ function buildAdiestraPeriodo(series, from, to) {
         let restantePago = adiestraPagado(a); // se va consumiendo cronológicamente
         let restanteDesc = adiestraDescuento(a); // el descuento cubre lo que queda después de lo pagado
         if (cajaSemana)
-            (a.pagos || []).forEach(pg => { const fp = (pg && pg.fecha) || a.desde || ""; if (fp >= from && fp <= to)
+            pagosDe(a).forEach(pg => { const fp = (pg && pg.fecha) || a.desde || ""; if (fp >= from && fp <= to)
                 cobrado += Number(pg && pg.monto) || 0; });
         adiestraFechas(a).forEach(f => {
             const precio = precioAdiestraEn(a, f); // precio vigente el día de ESA clase
@@ -5413,8 +5604,10 @@ function nubeAvisoTexto(clientes, paseos) {
 // solo salía con perros cargados. Ahora: botón en la bienvenida y, si ya pasaste la bienvenida, este aviso.
 // Su ✕ es aparte (cfg.avisoNubeEntrar) y no gasta los "más tarde" del de guardar.
 function nubeEntrarTexto() { return { t: "¿Ya usás PaseoCan en otro celular?", d: "Entrá con tu mail y traé tus datos", entrar: true }; }
-function avisosDeLaApp({ servicios, backup, shareMsg, primeros, nube, nubeCf }) {
+function avisosDeLaApp({ servicios, backup, shareMsg, primeros, nube, nubeCf, espacio }) {
     const out = [];
+    if (espacio)
+        out.push({ k: "esp", ic: "📦", t: "PaseoCan ocupa el " + espacio.pct + " % del espacio de este celular", d: "Cuando se llene, lo nuevo no se va a guardar · tocá para guardar un backup y escribime desde Ayuda", tono: "amb" });
     if (nubeCf)
         out.push({ k: "nubecf", ic: "☁️", t: "Tu cuenta se guardó desde otro celular", d: "Tocá para elegir qué datos quedan. Mientras, no se sube nada.", tono: "amb" });
     if (primeros)
@@ -9086,7 +9279,7 @@ function aplicarOtrosBaja(guarderias, adiestramiento, otros, dec, hoy) {
                 antes.push({ tipo: "cla", id: a.id, obj: a });
                 let b = o.fechas.reduce((x, f) => omitirClase(x, f, "quitar"), ensureAdiestra(a));
                 if (o.deMas > 0 && d.plata === "devuelvo")
-                    b = Object.assign(Object.assign({}, b), { pagos: [...(b.pagos || []), { id: uid(), fecha: hoy || td(), monto: -o.deMas, tipo: "devolucion" }] });
+                    b = Object.assign(Object.assign({}, b), { pagos: [...pagosDe(b), { id: uid(), fecha: hoy || td(), monto: -o.deMas, tipo: "devolucion" }] });
                 if (o.deMas > 0 && d.plata === "quedo") {
                     let x = o.deMas;
                     const dd = Math.min(adiestraDescuento(b), x);
@@ -10522,8 +10715,11 @@ function PagoDeMas({ monto, onElegir, onCancel }) {
 // Antes de eliminar un perro (20/11/2026, Matías: "Si"): eliminar borra TODOS sus paseos, también los hechos y
 // cobrados, y esa plata sale de Cobros y Stats. El cartel viejo decía solo "Se eliminan sus paseos". Ahora dice
 // cuánto se pierde y ofrece primero lo que conserva todo. Cobrado = plata que entró (pa menos lo absorbido).
-function resumenBorrarPerro(paseos, dogId, hoy) {
-    let hechos = 0, cobrado = 0, futuros = 0;
+// 21c (BUG-101): también cuenta sus estadías y clases (eliminar las borra junto con el perro). est/cla = cuántas
+// estadías (guarderías o pensionados) y series de clases no canceladas tiene; su plata cobrada suma a "cobrado".
+// Pierde también si tiene una estadía ya hecha o una clase dada, aunque no esté cobrada.
+function resumenBorrarPerro(paseos, dogId, hoy, guarderias, adiestramiento) {
+    let hechos = 0, cobrado = 0, futuros = 0, est = 0, cla = 0, hecho = false;
     (paseos || []).forEach(p => {
         if (!p || p.dogId !== dogId)
             return;
@@ -10535,7 +10731,75 @@ function resumenBorrarPerro(paseos, dogId, hoy) {
         if (p.status === "programado" && (p.fecha || "") >= hoy)
             futuros++;
     });
-    return { hechos, cobrado, futuros, pierde: hechos > 0 || cobrado > 0 };
+    (guarderias || []).forEach(e => {
+        if (!e || e.dogId !== dogId || e.estado === "cancelada")
+            return;
+        est++;
+        cobrado += estadiaPagado(e);
+        if (e.estado === "realizada" || (e.desde || "") < hoy)
+            hecho = true;
+    });
+    (adiestramiento || []).forEach(a => {
+        if (!a || a.dogId !== dogId || a.estado === "cancelada")
+            return;
+        cla++;
+        cobrado += adiestraPagado(a);
+        if (Object.values((a.clases) || {}).some(c => c && c.dada))
+            hecho = true;
+    });
+    return { hechos, cobrado, futuros, est, cla, pierde: hechos > 0 || cobrado > 0 || hecho };
+}
+// Lo que se borra junto con los perros eliminados (21c, BUG-101): sus estadías y sus series de clases. Antes
+// quedaban sueltas, sin perro: el encabezado y Stats las sumaban y Cobros no (ningún cliente las mostraba).
+// Estadías y clases que quedaron sin perro (BUG-101: antes eliminar un perro las dejaba). Matías (21/11): borrarlas.
+// Solo las que apuntan a un perro que no existe; si no hay ninguna devuelve el MISMO arreglo (no re-guarda).
+function sinHuerfanos(xs, dogs) {
+    if (!Array.isArray(xs) || !Array.isArray(dogs))
+        return xs;
+    const ids = new Set(dogs.filter(Boolean).map(d => d.id));
+    return xs.some(x => x && x.dogId && !ids.has(x.dogId)) ? xs.filter(x => !(x && x.dogId && !ids.has(x.dogId))) : xs;
+}
+// Borrar un cliente archivado (21d): lo mismo que el perro, sumado entre todos sus perros.
+function resumenBorrarCliente(paseos, dogs, cid, hoy, guarderias, adiestramiento) {
+    const o = { hechos: 0, cobrado: 0, futuros: 0, est: 0, cla: 0, pierde: false, perros: 0 };
+    (dogs || []).filter(d => d && d.cid === cid).forEach(d => {
+        const r = resumenBorrarPerro(paseos, d.id, hoy, guarderias, adiestramiento);
+        o.perros++;
+        ["hechos", "cobrado", "futuros", "est", "cla"].forEach(k => { o[k] += r[k]; });
+        if (r.pierde)
+            o.pierde = true;
+    });
+    return o;
+}
+function textoBorrarTodoCliente(r) {
+    const sv = serviciosBorrarTxt(r);
+    return "Se borran " + juntarY([r.perros === 1 ? "su perro" : "sus " + r.perros + " perros", "sus paseos"].concat(serviciosBorrarLista(r))) + ", y esa plata sale de Cobros y Stats. No se puede deshacer.";
+}
+function juntarY(a) { return a.length > 1 ? a.slice(0, -1).join(", ") + " y " + a[a.length - 1] : (a[0] || ""); }
+function serviciosBorrarLista(r) { const a = []; if (r.est)
+    a.push(r.est === 1 ? "su estadía" : "sus " + r.est + " estadías"); if (r.cla)
+    a.push(r.cla === 1 ? "su serie de clases" : "sus " + r.cla + " series de clases"); return a; }
+function serviciosBorrarTxt(r) { return juntarY(serviciosBorrarLista(r)); }
+function textoBorrarPerro(r) {
+    const a = [];
+    if (r.hechos || (!r.est && !r.cla))
+        a.push(r.hechos + (r.hechos === 1 ? " paseo hecho" : " paseos hechos"));
+    if (r.est)
+        a.push(r.est + (r.est === 1 ? " estadía" : " estadías"));
+    if (r.cla)
+        a.push(r.cla + (r.cla === 1 ? " serie de clases" : " series de clases"));
+    return "Tiene " + a.join(", ") + " y " + $(r.cobrado) + " cobrados.";
+}
+// Lo que pasa con "No, borrar todo" (21d, Matías: "¿no sería conveniente que pregunte si el historial querés que quede?").
+function textoBorrarTodo(r) {
+    const sv = serviciosBorrarTxt(r);
+    return "Se borran " + juntarY(["sus paseos"].concat(serviciosBorrarLista(r))) + ", y esa plata sale de Cobros y Stats. No se puede deshacer.";
+}
+function sinDePerros(xs, dogIds) {
+    const ids = new Set(dogIds || []);
+    if (!Array.isArray(xs) || !ids.size)
+        return xs;
+    return xs.some(x => x && ids.has(x.dogId)) ? xs.filter(x => !(x && ids.has(x.dogId))) : xs;
 }
 function Confirm({ title, sub, onOk, onCancel, danger, aviso, bloqueado }) {
     return (React.createElement("div", { style: { position: "fixed", inset: 0, overflowY: "auto", background: "rgba(0,0,0,.8)", zIndex: 300, display: "flex", alignItems: "center", justifyContent: "center", padding: 24 } },
@@ -14037,7 +14301,7 @@ function CobrosFicha({ data, paseos, wk, adjTotal, onVolver, onCobrar, estPend =
                             React.createElement("span", { style: { color: C.red } }, "+" + $(totalHistorico))),
                         showHistorial[cl.id] && historialOrdenado.map(h => (React.createElement("div", { key: h.wkFrom, style: { background: "#1a0505", borderRadius: 8, padding: "6px 10px", marginTop: 4, border: `1px solid ${C.red}22` } },
                             React.createElement("div", { style: { display: "flex", justifyContent: "space-between", marginBottom: 2 } },
-                                React.createElement("span", { style: { fontSize: 12, color: C.mut } }, h.esMensual ? (MONTHS[Number(h.wkFrom.slice(5, 7)) - 1] + " " + h.wkFrom.slice(0, 4)) : h.wkFrom),
+                                React.createElement("span", { style: { fontSize: 12, color: C.mut } }, etiquetaDeAntes(h)),
                                 React.createElement("b", { style: { fontSize: 12, color: C.red } }, $(h.total))),
                             h.perros.map(pr => (React.createElement("div", { key: pr.dogId, style: { fontSize: 12, color: C.mut, paddingLeft: 8 } }, pr.dogName + ": " + $(pr.debe)))))))))))));
         })(),
@@ -14057,7 +14321,7 @@ function EstadiaCobroCard({ e, dog, setGuarderias, T }) {
     const col = n > 0 ? C.blu : C.amb;
     const cobrar = () => { const m = Number(monto) || 0; if (m <= 0)
         return; setGuarderias(gs => (gs || []).map(x => x.id === e.id ? registrarPagoEstadia(x, m, tipo, T, true) : x)); avisarUso("cobros"); };
-    const pagos = (e.pagos || []);
+    const pagos = pagosDe(e);
     return (React.createElement("div", { style: Object.assign(Object.assign({}, CARD), { border: `1px solid ${saldo <= 0 ? C.grn : col}44`, background: "#161a13", marginBottom: 8 }) },
         React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8 } },
             React.createElement("div", { style: { flex: 1 } },
@@ -14088,7 +14352,7 @@ function ClaseCobroCard({ a, dog, setAdiestramiento, T }) {
     const monto = precio > 0 ? Math.min(sumaNc, saldo) : saldo;
     const cobrar = () => { const m = Math.min(monto, saldo); if (m <= 0)
         return; setAdiestramiento(as => (as || []).map(x => x.id === a.id ? registrarPagoAdiestra(x, m, T) : x)); avisarUso("cobros"); };
-    const pagos = (a.pagos || []);
+    const pagos = pagosDe(a);
     return (React.createElement("div", { style: Object.assign(Object.assign({}, CARD), { border: `1px solid ${saldo <= 0 ? C.grn : C.blu}44`, background: "#11161d", marginBottom: 8 }) },
         React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8 } },
             React.createElement("div", { style: { flex: 1 } },
@@ -14908,6 +15172,13 @@ function pendientesAlArchivar(cid, dogs, guarderias, adiestramiento, T) {
     });
     return out;
 }
+// Borrar un cliente archivado sin historia (21d, Matías: "no avisa de la estadía que tiene futura"): nombra lo agendado.
+function agendadoAlBorrar(cid, dogs, guarderias, adiestramiento, T) {
+    const ps = pendientesAlArchivar(cid, dogs, guarderias, adiestramiento, T);
+    if (!ps.length)
+        return "";
+    return "Ojo, tiene agendado: " + ps.map(x => x.txt).join(" · ") + ". Si lo borrás, " + (ps.length === 1 ? "se borra" : "se borran") + " también.";
+}
 function avisoArchivar(cid, dogs, guarderias, adiestramiento, T) {
     const ps = pendientesAlArchivar(cid, dogs, guarderias, adiestramiento, T);
     if (!ps.length)
@@ -15200,7 +15471,6 @@ function compararClientesAZ(a, b) {
     return na.localeCompare(nb, "es", { sensitivity: "base", numeric: true });
 }
 function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setWaTpl, partes, setPartes, dogs, setDogs, clients, setClients, paseos, setPaseos, gg, setGG, onAdd, onGoCobros, clienteInicial, onClienteInicialUsado, dogEditInicial, onDogEditConsumed, mDogs, routes, edgeMemory, waTpl, cfg, guarderias, adiestramiento, congeladas, onEditSerie, onEditClase, onEditEstadia, onAddEstadia, onAddClase, setCfg, ajustes, ajPeriodo }) {
-    var _b;
     const [sel, setSel] = useState(null);
     const [modoCli, setModoCli] = useState("lista");
     const [waCli, setWaCli] = useState(null);
@@ -15438,7 +15708,7 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
     const [otroPerro, setOtroPerro] = useState(null);
     const empezarOtroPerro = () => { if (!otroPerro)
         return; setNDog(perroDelMismoCliente(otroPerro.base, ED)); setOtroPerro(null); setAddD(true); };
-    const doDelDog = id => { setDogs(ds => ds.filter(d => d.id !== id)); setPaseos(ps => ps.filter(p => p.dogId !== id)); setDelD(null); setEditD(null); };
+    const doDelDog = id => { setDogs(ds => ds.filter(d => d.id !== id)); setPaseos(ps => ps.filter(p => p.dogId !== id)); setGuarderias(gs => sinDePerros(gs, [id])); setAdiestramiento(as => sinDePerros(as, [id])); setDelD(null); setEditD(null); };
     // Archivar: NO borra nada. Marca el cliente archivado y cancela solo los paseos
     // FUTUROS programados (no tiene sentido seguir agendando). Conserva completados
     // e historial intactos -> finanzas y stats del pasado no se mueven.
@@ -15450,7 +15720,7 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
     };
     const doReactivarCl = cid => { setClients(cs => cs.map(c => c.id === cid ? Object.assign(Object.assign({}, c), { archivado: false }) : c)); };
     // Borrado FÍSICO definitivo (solo accesible desde la vista de archivados, con doble confirmación).
-    const doDelCl = cid => { const ids = dogs.filter(d => d.cid === cid).map(d => d.id); setDogs(ds => ds.filter(d => d.cid !== cid)); setPaseos(ps => ps.filter(p => !ids.includes(p.dogId))); setClients(cs => cs.filter(c => c.id !== cid)); setSel(null); };
+    const doDelCl = cid => { const ids = dogs.filter(d => d.cid === cid).map(d => d.id); setDogs(ds => ds.filter(d => d.cid !== cid)); setPaseos(ps => ps.filter(p => !ids.includes(p.dogId))); setGuarderias(gs => sinDePerros(gs, ids)); setAdiestramiento(as => sinDePerros(as, ids)); setClients(cs => cs.filter(c => c.id !== cid)); setSel(null); };
     // ── Bloqueo de alta sin precio ────────────────────────────────────────────
     // Un grupo sin monto cargado no tiene con qué cobrar: calcCobro lo manda a la
     // rama vieja de pack y le estampa la tabla por defecto sin avisar. Se corta en
@@ -15660,7 +15930,30 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
                     }),
                     verArch && React.createElement("div", { style: { fontSize: 12, color: C.mut, padding: "8px 4px 0", lineHeight: 1.4 } }, "Los archivados conservan su historial en finanzas y estadísticas. 'Reactivar' los vuelve a la lista. La papelera los borra definitivamente (no se puede deshacer).")));
             })(),
-            confDelFis && React.createElement(Confirm, { title: "Borrar definitivamente?", sub: "Se elimina " + (((_b = clients.find(c => c.id === confDelFis)) === null || _b === void 0 ? void 0 : _b.name) || "el cliente") + ", sus perros y TODO su historial. Esto sí afecta finanzas y stats. No se puede deshacer.", onOk: () => { doDelCl(confDelFis); setConfDelFis(null); }, onCancel: () => setConfDelFis(null), danger: true }),
+            confDelFis && (() => {
+                const c = clients.find(x => x.id === confDelFis);
+                if (!c)
+                    return null;
+                const r = resumenBorrarCliente(paseos, dogs, c.id, td(), guarderias, adiestramiento);
+                const nom = c.name || "el cliente";
+                const pend = agendadoAlBorrar(c.id, dogs, guarderias, adiestramiento, td());
+                const cerrar = () => setConfDelFis(null);
+                const borrar = () => { doDelCl(c.id); setConfDelFis(null); };
+                return (React.createElement("div", { id: "pc-borrar-cliente", style: { position: "fixed", inset: 0, overflowY: "auto", background: "rgba(0,0,0,.8)", zIndex: 300, display: "flex", alignItems: "center", justifyContent: "center", padding: 24 } },
+                    React.createElement("div", { style: { margin: "auto", background: C.card, borderRadius: 20, padding: 24, maxWidth: 360, width: "100%", border: `1px solid ${C.bdr}` } }, r.pierde ? React.createElement(React.Fragment, null,
+                        React.createElement("div", { style: { fontWeight: 800, fontSize: 18, color: C.txt, marginBottom: 8 } }, "¿Querés que quede el historial de " + nom + "?"),
+                        React.createElement("div", { id: "pc-borrar-cliente-pierde", style: { fontSize: 14, color: C.txt, lineHeight: 1.5 } }, textoBorrarPerro(r)),
+                        React.createElement("button", { id: "pc-borrar-cliente-queda", onClick: cerrar, style: Object.assign(Object.assign({}, BR("primario", false)), { width: "100%", marginTop: 16 }) }, "✅ Sí, que quede"),
+                        React.createElement("div", { style: { fontSize: 12.5, color: C.mut, lineHeight: 1.45, marginTop: 6 } }, "Sigue en Archivados con todo: lo hecho, lo cobrado y lo que debe."),
+                        React.createElement("button", { id: "pc-borrar-cliente-ok", onClick: borrar, style: Object.assign(Object.assign({}, Btn("#7f1d1d", C.txt)), { width: "100%", marginTop: 14 }) }, "🗑️ No, borrar todo"),
+                        React.createElement("div", { style: { fontSize: 12.5, color: C.amb, fontWeight: 700, lineHeight: 1.45, marginTop: 6 } }, textoBorrarTodoCliente(r))) : React.createElement(React.Fragment, null,
+                        React.createElement("div", { style: { fontWeight: 800, fontSize: 18, color: C.txt, marginBottom: 8 } }, "¿Borrar a " + nom + "?"),
+                        React.createElement("div", { style: { fontSize: 14, color: C.mut, lineHeight: 1.5 } }, "No tiene paseos hechos ni cobros" + (pend ? "." : ": se borra sin perder nada, con " + (r.perros === 1 ? "su perro" : "sus perros") + ".")),
+                        pend && React.createElement("div", { id: "pc-borrar-cliente-agendado", style: { fontSize: 13.5, color: C.amb, fontWeight: 700, lineHeight: 1.45, marginTop: 10 } }, pend),
+                        React.createElement("div", { style: { display: "flex", gap: 10, marginTop: 12 } },
+                            React.createElement("button", { id: "pc-borrar-cliente-cancelar", onClick: cerrar, style: Object.assign(Object.assign({}, BR("secundario", false)), { flex: 1 }) }, "Cancelar"),
+                            React.createElement("button", { id: "pc-borrar-cliente-ok", onClick: borrar, style: Object.assign(Object.assign({}, Btn("#7f1d1d", C.txt)), { flex: 1 }) }, "Borrar"))))));
+            })(),
             modalGrupo && (React.createElement("div", { onClick: () => setModalGrupo(false), style: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "flex-end", zIndex: 150 } },
                 React.createElement("div", { onClick: e => e.stopPropagation(), style: { width: "100%", maxWidth: 430, margin: "0 auto", background: C.card, borderTopLeftRadius: 20, borderTopRightRadius: 20, border: `1px solid ${C.bdr}`, padding: 18, paddingBottom: 28, maxHeight: "70vh", overflowY: "auto", position: "relative" } },
                     React.createElement(XCerrar, { onClick: () => setModalGrupo(false) }),
@@ -16003,7 +16296,7 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
                     React.createElement("div", { style: { fontSize: 12, color: C.mut, marginTop: 4, lineHeight: 1.4 } }, "El día siguiente se archiva solo."),
                     React.createElement("button", { id: "pc-baja-deshacer", onClick: () => deshacerLaBaja(editC.id), style: { background: "transparent", border: "none", color: C.blu, fontSize: 13, fontWeight: 700, cursor: "pointer", padding: "6px 0 0" } }, "Deshacer (sigue con el servicio)"))) : (React.createElement("button", { id: "pc-baja-abrir", onClick: () => setBajaM({ cid: editC.id, ultimo: td(), elecciones: {} }), style: Object.assign(Object.assign({}, BR("secundario", false)), { width: "100%", fontSize: 13, marginBottom: 10 }) }, "👋 Deja el servicio")),
                 React.createElement("button", { onClick: () => setConfArch(true), style: Object.assign(Object.assign({}, Btn("#1a1505", "#fcd34d")), { width: "100%", fontSize: 13 }) }, "Archivar cliente"),
-                confArch && React.createElement(Confirm, { title: "¿Archivar a " + ((editC === null || editC === void 0 ? void 0 : editC.name) || "este cliente") + "?", aviso: avisoArchivar(editC && editC.id, dogs, guarderias, adiestramiento, td()) || undefined, sub: "Desaparece de tu lista pero conserva todo su historial. Sus paseos futuros se cancelan. Lo podés reactivar cuando quieras desde 'Archivados'.", onOk: () => { doArchiveCl(editC.id); setConfArch(false); setEditC(null); }, onCancel: () => setConfArch(false) })))),
+                confArch && React.createElement(Confirm, { title: "¿Archivar a " + ((editC === null || editC === void 0 ? void 0 : editC.name) || "este cliente") + "?", aviso: avisoArchivar(editC && editC.id, dogs, guarderias, adiestramiento, td()) || undefined, sub: "Desaparece de tu lista pero conserva todo su historial. Sus paseos que vienen se borran. Queda al final de Clientes, en 'Archivados': ahí lo podés reactivar o, si querés, eliminarlo del todo.", onOk: () => { doArchiveCl(editC.id); setConfArch(false); setEditC(null); }, onCancel: () => setConfArch(false) })))),
         bajaM && (() => {
             const cl = clients.find(c => c.id === bajaM.cid);
             const plan = bajaM.ultimo ? bajaPlan(bajaM.cid, dogs.map(migDog), paseos, bajaM.ultimo, bajaM.dogId, descCli(bajaM.cid)) : { grupos: [], cancelar: 0 };
@@ -16251,7 +16544,7 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
             const d = mDogs.find(x => x.id === delD);
             if (!d)
                 return null;
-            const r = resumenBorrarPerro(paseos, delD, td());
+            const r = resumenBorrarPerro(paseos, delD, td(), guarderias, adiestramiento);
             const cl = clients.find(c => c.id === d.cid);
             const unico = !mDogs.some(x => x.cid === d.cid && x.id !== d.id && !x.baja);
             // Alternativa: si es el único perro, "Deja el servicio" (el cliente); si tiene más, "Dejó de venir" (solo ese
@@ -16263,15 +16556,19 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
             } };
             const conAlt = cl && !cl.baja && !d.baja;
             return (React.createElement("div", { id: "pc-borrar-perro", style: { position: "fixed", inset: 0, overflowY: "auto", background: "rgba(0,0,0,.8)", zIndex: 300, display: "flex", alignItems: "center", justifyContent: "center", padding: 24 } },
-                React.createElement("div", { style: { margin: "auto", background: C.card, borderRadius: 20, padding: 24, maxWidth: 360, width: "100%", border: `1px solid ${C.bdr}` } },
+                React.createElement("div", { style: { margin: "auto", background: C.card, borderRadius: 20, padding: 24, maxWidth: 360, width: "100%", border: `1px solid ${C.bdr}` } }, r.pierde ? React.createElement(React.Fragment, null,
+                    React.createElement("div", { style: { fontWeight: 800, fontSize: 18, color: C.txt, marginBottom: 8 } }, "¿Querés que quede el historial de " + d.name + "?"),
+                    React.createElement("div", { id: "pc-borrar-perro-pierde", style: { fontSize: 14, color: C.txt, lineHeight: 1.5 } }, textoBorrarPerro(r)),
+                    React.createElement("button", { id: "pc-borrar-perro-alt", onClick: conAlt ? alt : () => setDelD(null), style: Object.assign(Object.assign({}, BR("primario", false)), { width: "100%", marginTop: 16 }) }, "✅ Sí, que quede"),
+                    React.createElement("div", { style: { fontSize: 12.5, color: C.mut, lineHeight: 1.45, marginTop: 6 } }, !conAlt ? "Ya dejó de venir: queda como está, con todo su historial." : (unico ? "Deja el servicio: se van los paseos que vienen. Lo hecho, lo cobrado y lo que debe quedan." : "Dejó de venir: se van los paseos que vienen. Lo hecho, lo cobrado y lo que te debe quedan.")),
+                    React.createElement("button", { id: "pc-borrar-perro-ok", onClick: () => doDelDog(delD), style: Object.assign(Object.assign({}, Btn("#7f1d1d", C.txt)), { width: "100%", marginTop: 14 }) }, "🗑️ No, borrar todo"),
+                    React.createElement("div", { style: { fontSize: 12.5, color: C.amb, fontWeight: 700, lineHeight: 1.45, marginTop: 6 } }, textoBorrarTodo(r)),
+                    React.createElement("button", { id: "pc-borrar-perro-cancelar", onClick: () => setDelD(null), style: Object.assign(Object.assign({}, BR("secundario", false)), { width: "100%", marginTop: 14 }) }, "Cancelar")) : React.createElement(React.Fragment, null,
                     React.createElement("div", { style: { fontWeight: 800, fontSize: 18, color: C.txt, marginBottom: 8 } }, "¿Eliminar a " + d.name + "?"),
-                    r.pierde ? React.createElement(React.Fragment, null,
-                        React.createElement("div", { id: "pc-borrar-perro-pierde", style: { fontSize: 14, color: C.txt, lineHeight: 1.5 } }, "Tiene " + r.hechos + (r.hechos === 1 ? " paseo hecho" : " paseos hechos") + " y " + $(r.cobrado) + " cobrados. Si lo eliminás, se borran todos sus paseos y esa plata sale de Cobros y Stats."),
-                        React.createElement("div", { style: { fontSize: 13.5, color: C.amb, fontWeight: 700, lineHeight: 1.45, marginTop: 10 } }, !conAlt ? "Si te debe algo por " + d.name + ", cobralo antes: eliminarlo también borra lo que te debe." : (unico ? "Si " + (cl.name || "el cliente") + " dejó de venir, usá \"Deja el servicio\": se van los paseos que vienen y lo hecho y cobrado queda." : "Si " + d.name + " dejó de venir, usá \"Dejó de venir\": se van los paseos que vienen y lo hecho, lo cobrado y lo que te debe quedan.")),
-                        conAlt && React.createElement("button", { id: "pc-borrar-perro-alt", onClick: alt, style: Object.assign(Object.assign({}, BR("primario", false)), { width: "100%", marginTop: 14 }) }, unico ? "👋 Deja el servicio" : "👋 Dejó de venir")) : React.createElement("div", { style: { fontSize: 14, color: C.mut, lineHeight: 1.5 } }, "No tiene paseos hechos ni cobros: se borra sin perder nada." + (r.futuros ? " También se borran sus " + r.futuros + " paseos agendados." : "")),
+                    React.createElement("div", { style: { fontSize: 14, color: C.mut, lineHeight: 1.5 } }, "No tiene paseos hechos ni cobros: se borra sin perder nada." + (r.futuros ? " También se borran sus " + r.futuros + " paseos agendados." : "") + (r.est || r.cla ? " También se " + ((r.est + r.cla) > 1 ? "borran " : "borra ") + serviciosBorrarTxt(r) + "." : "")),
                     React.createElement("div", { style: { display: "flex", gap: 10, marginTop: 12 } },
                         React.createElement("button", { id: "pc-borrar-perro-cancelar", onClick: () => setDelD(null), style: Object.assign(Object.assign({}, BR("secundario", false)), { flex: 1 }) }, "Cancelar"),
-                        React.createElement("button", { id: "pc-borrar-perro-ok", onClick: () => doDelDog(delD), style: Object.assign(Object.assign({}, Btn("#7f1d1d", C.txt)), { flex: 1 }) }, r.pierde ? "Eliminar igual" : "Eliminar")))));
+                        React.createElement("button", { id: "pc-borrar-perro-ok", onClick: () => doDelDog(delD), style: Object.assign(Object.assign({}, Btn("#7f1d1d", C.txt)), { flex: 1 }) }, "Eliminar"))))));
         })()));
 }
 /* └── FIN: screens/Clientes.jsx ─────────────────────────────────────────── */
@@ -16383,8 +16680,16 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
 // ╚══════════════════════════════════════════════════════════════════════════╝
 // d = {paseos,mDogs,clients,guarderias,adiestramiento,ventas,ajustes,congeladas,ajPeriodo}
 function finDeMes(ym) { const [y, m] = String(ym).split("-").map(Number); return ym + "-" + p2(new Date(y, m, 0).getDate()); }
+// Velocidad (21e, revisión de estabilidad, hallazgo 1): la plata de UN período mira solo los paseos del período y los
+// de 31 días alrededor (paseosCerca). Las reglas de plata trabajan dentro de su semana o su mes; el margen cubre las
+// semanas que cruzan de mes. Antes cada cálculo recorría TODA la historia, y Stats hace decenas (24 meses de historial,
+// el mes anterior, la tarjeta): con 3 años de datos tardaba 6 s en abrir, con un paseador grande 22 s. Mismo resultado
+// byte a byte en 521 semanas y meses de 11 juegos de datos (test "Stats rápido con historia"). "Lo de antes" (deuda
+// vieja, quienTeDebe) NO usa esto: necesita toda la historia.
+const VENTANA_PERIODO = 31;
+function paseosCerca(paseos, from, to, dias) { const a = addDays(from, -dias), b = addDays(to, dias); return (paseos || []).filter(p => p && p.fecha >= a && p.fecha <= b); }
 function cobradoPeriodoGeneral(d, from, to) {
-    const pf = buildPeriodoFinanciero(d.paseos || [], d.mDogs || [], d.clients || [], from, to, d.ajustes, d.congeladas, d.ajPeriodo);
+    const pf = buildPeriodoFinanciero(paseosCerca(d.paseos, from, to, VENTANA_PERIODO), d.mDogs || [], d.clients || [], from, to, d.ajustes, d.congeladas, d.ajPeriodo);
     const est = buildEstadiaPeriodo(d.guarderias || [], from, to);
     const adi = buildAdiestraPeriodo(d.adiestramiento || [], from, to);
     const ven = Math.max(0, Number(resumenVentas(d.ventas || [], from, to).total) || 0);
@@ -16395,11 +16700,12 @@ function cobradoPeriodoGeneral(d, from, to) {
 // (lo mismo que el encabezado); antes = "de antes" de Cobros (quienTeDebe.totalAntes).
 function resumenStatsPeriodo(d, from, to) {
     const c = cobradoPeriodoGeneral(d, from, to);
-    const dxc = deudaPorCliente(d.paseos || [], d.mDogs || [], d.clients || [], from, to, d.ajustes, d.congeladas, d.ajPeriodo);
+    const cerca = paseosCerca(d.paseos, from, to, VENTANA_PERIODO);
+    const dxc = deudaPorCliente(cerca, d.mDogs || [], d.clients || [], from, to, d.ajustes, d.congeladas, d.ajPeriodo);
     const tg = totalesGenerales(c.pf, dxc, c.estP, c.adiP, c.ven);
     const q = quienTeDebe({ clients: d.clients || [], mDogs: d.mDogs || [], paseos: d.paseos || [], guarderias: d.guarderias || [], adiestramiento: d.adiestramiento || [], from, to, ajustes: d.ajustes, congeladas: d.congeladas, ajPeriodo: d.ajPeriodo });
     // perdVista / det (BUG-057): lo que muestra la tarjeta. tg.perd (neta) sigue siendo la del motor.
-    const det = detallePerdida(c.pf, d.mDogs || [], d.clients || [], d, from, to);
+    const det = detallePerdida(c.pf, d.mDogs || [], d.clients || [], Object.assign(Object.assign({}, d), { paseos: cerca }), from, to);
     return { cob: tg.cob, rest: tg.rest, perd: tg.perd, perdVista: Math.max(det.total, 0), deMas: det.deMas, det, sobrante: tg.sobrante, antes: q.totalAntes > 0.5 ? q.totalAntes : 0,
         partes: { pas: c.pas, est: c.est, adi: c.adi, ven: c.ven }, pf: c.pf };
 }
@@ -16413,7 +16719,7 @@ function primerMesConDatos(d, hoy) {
         ver(p.fecha); });
     (d.guarderias || []).forEach(e => { if (e && (e.estado || "realizada") !== "cancelada")
         ver(e.desde); });
-    (d.adiestramiento || []).forEach(a => ((a && a.pagos) || []).forEach(x => ver(x && x.fecha)));
+    (d.adiestramiento || []).forEach(a => pagosDe(a).forEach(x => ver(x && x.fecha)));
     (d.ventas || []).forEach(v => ver(v && v.fecha));
     return min;
 }
@@ -17327,7 +17633,8 @@ function Stats({ svc, waTpl, paseos, clients, selWk, onWk, selMo, onMo, sec, onS
             (adiestramiento || []).map(ensureAdiestra).forEach(a => {
                 const refund = a.estado === "cancelada" && !a.senaRetenida;
                 if (!refund)
-                    (a.pagos || []).forEach(p => { const ym = ((p && p.fecha) || "").slice(0, 7); if (!ym)
+                    pagosDe(a).forEach(p => { if (!p)
+                        return; const ym = ((p && p.fecha) || "").slice(0, 7); if (!ym)
                         return; if (!adiM[ym])
                         adiM[ym] = { ing: 0, count: 0 }; adiM[ym].ing += Number(p.monto) || 0; });
                 if (a.estado !== "cancelada")
@@ -18054,6 +18361,7 @@ function App() {
     const [routeLugIdMigrated, setRouteLugIdMigrated] = usePersist("pc_route_lugid_v1", false);
     const [rutaGrupoMigrated, setRutaGrupoMigrated] = usePersist("pc_ruta_grupo_v1", false);
     const [kmFixHecho, setKmFixHecho] = usePersist("pc_km_fix_v1", false);
+    const [huerfanosHecho, setHuerfanosHecho] = usePersist("pc_huerfanos_v1", false);
     const [confReset, setConfReset] = useState(false);
     const [borrarTxt, setBorrarTxt] = useState("");
     const [showBackup, setShowBackup] = useState(false);
@@ -18443,6 +18751,20 @@ function App() {
         setKmFixHecho(true);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
+    // Espacio usado (hallazgo 2a): se vuelve a medir un rato después de cada cambio de datos.
+    useEffect(() => { const t = setTimeout(() => setEspacioUsado(storage.tamano()), 1500); return () => clearTimeout(t); }, [paseos, dogs, clients, guarderias, adiestramiento, cfgRaw]);
+    // BUG-101: una sola vez por celular, borrar las estadías y clases de perros ya eliminados (ver sinHuerfanos).
+    useEffect(() => {
+        if (huerfanosHecho)
+            return;
+        // Si los perros no se pudieron leer (dato dañado o sin guardar) son los de ejemplo: NO se limpia nada.
+        if (dogs === INIT_DOGS || PC_SALUD.danados.length)
+            return;
+        setGuarderias(gs => sinHuerfanos(gs, dogs));
+        setAdiestramiento(as => sinHuerfanos(as, dogs));
+        setHuerfanosHecho(true);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
     useEffect(() => {
         if (routeLugIdMigrated)
             return;
@@ -18616,6 +18938,7 @@ function App() {
     catch (e) { } }; }, []);
     // Sin internet (24/10/2026): se revisa al abrir el Menú y cuando el sw.js avisa que guardó.
     const [sinInternet, setSinInternet] = useState("revisando");
+    const [espacioUsado, setEspacioUsado] = useState(() => storage.tamano());
     useEffect(() => {
         if (!showMenu)
             return;
@@ -18661,10 +18984,11 @@ function App() {
             setPaseos(corregirKmFotos(d.paseos, (d.cfg && d.cfg.minPorKm) || (cfg && cfg.minPorKm) || 15));
         else if (d.dogs)
             setPaseos(initPaseos(d.dogs));
+        // Un backup puede traer estadías o clases de perros ya eliminados (BUG-101): no entran.
         if (d.guarderias)
-            setGuarderias(d.guarderias);
+            setGuarderias(sinHuerfanos(d.guarderias, d.dogs || dogs));
         if (d.adiestramiento)
-            setAdiestramiento(d.adiestramiento);
+            setAdiestramiento(sinHuerfanos(d.adiestramiento, d.dogs || dogs));
         // Ventas: los backups viejos no las traen → no se tocan las que haya en el celular.
         if (Array.isArray(d.articulos))
             setArticulos(d.articulos.map(ensureArticulo));
@@ -19105,6 +19429,23 @@ function App() {
     const syncBaseRef = useRef(undefined);
     if (syncBaseRef.current === undefined)
         syncBaseRef.current = storage.load("pc_sync_base", null);
+    // IndexedDB (etapa 1): la base se carga UNA vez (baseLista) y todo cambio de base va en fila detrás (syncBaseCola),
+    // así nunca se pisa en desorden. sincronizar y nubeDespuesDeEntrar esperan a baseLista().
+    const idbRef = useRef(null), baseEnIdb = useRef(false), syncBaseCarga = useRef(null), syncBaseCola = useRef(null), baseTocada = useRef(false);
+    const baseLista = () => {
+        if (!syncBaseCarga.current)
+            syncBaseCarga.current = (async () => {
+                const db = await idbAbrir();
+                idbRef.current = db;
+                const r = await cargarBaseSync({ db, leerLS: () => storage.load("pc_sync_base", null), borrarLS: () => storage.remove("pc_sync_base") });
+                baseEnIdb.current = r.enIdb;
+                if (!baseTocada.current)
+                    syncBaseRef.current = r.base; // si la base cambió mientras cargaba, vale la nueva
+            })().catch(() => { });
+        return syncBaseCarga.current;
+    };
+    useEffect(() => { const n = nubeRef.current; if ((n && n.ses) || storage.load("pc_sync_base", null))
+        baseLista(); }, []);
     const syncPrev = useRef(null), syncGen = useRef(0), syncToco = useRef(false), syncOtraVez = useRef(false), nubeUltimo = useRef(0), syncRef = useRef(null);
     // Hasta que la persona toca algo, lo que cambia es la app sola (migraciones al abrir): se anota sin hora.
     useEffect(() => {
@@ -19126,8 +19467,10 @@ function App() {
         const n = nubeRef.current;
         const x = b ? Object.assign(Object.assign({}, b), { uid: n && n.ses && n.ses.uid }) : null;
         syncBaseRef.current = x;
-        if (!x || !storage.guardarSinAviso("pc_sync_base", x))
-            storage.remove("pc_sync_base");
+        baseTocada.current = true;
+        syncBaseCola.current = (syncBaseCola.current || baseLista()).then(async () => {
+            baseEnIdb.current = await guardarBaseSync({ db: idbRef.current, enIdb: baseEnIdb.current, base: x, guardarLS: v => storage.guardarSinAviso("pc_sync_base", v), borrarLS: () => storage.remove("pc_sync_base") });
+        }).catch(() => { });
     };
     // Anota qué cambió desde la última foto (y a qué hora). Devuelve true si hubo algo.
     const syncRegistrar = () => {
@@ -19179,6 +19522,7 @@ function App() {
         nubeOcupado.current = true;
         setNubeEstado(e => e === "pendiente" || e === "error" ? "subiendo" : e);
         try {
+            await baseLista(); // IndexedDB: sin la base cargada vería "primera vez" y preguntaría sin motivo
             const ses = await sesionViva();
             if (!ses) {
                 setNubeEstado("error");
@@ -19268,6 +19612,7 @@ function App() {
             setNubeElegir({ tipo: "traer", fila: r.fila });
             return;
         }
+        await baseLista();
         if (syncBase() || !nubeConflicto(r.fila, miInst(), nubeRef.current && nubeRef.current.ultSync))
             sincronizar(true);
         else
@@ -19407,7 +19752,16 @@ function App() {
             }
             if (typeof fetch !== "function")
                 return;
-            contarApertura(fetch, { url: SUPA_URL, key: SUPA_KEY, inst, ver: APP_VER }).then(ok => { if (ok)
+            let uso;
+            try {
+                const ps = storage.load("pc_paseos", []);
+                const nb = storage.load("pc_nube", null);
+                uso = usoParaContar({ usado: storage.tamano(), limite: LIMITE_ESPACIO, paseos: Array.isArray(ps) ? ps.length : 0, nube: !!(nb && nb.ses) });
+            }
+            catch (e) {
+                uso = undefined;
+            }
+            contarApertura(fetch, { url: SUPA_URL, key: SUPA_KEY, inst, ver: APP_VER, uso }).then(ok => { if (ok)
                 storage.save("pc_contador_dia", hoy); });
         };
         intentar();
@@ -19513,7 +19867,7 @@ function App() {
     const ppVisible = mostrarPrimeros(primeros, pasosPP);
     const avisoBk = avisoBackup(copia.fecha, backupPospuesto, T, (clients || []).length > 0 || (paseos || []).length > 0);
     const avisosApp = avisosDeLaApp({ servicios: !!(cfg && !cfg.servicios && !cfg.avisoServicios) && !primeros, backup: (avisoBk.mostrar && !ppVisible) ? avisoBk : null, shareMsg, primeros: avisoPrimeros(primeros, pasosPP, T),
-        nube: !nubeEsLink || (nube && nube.ses) ? null : ((dogs || []).length > 0 ? (nubeAvisoVisible(cfg && cfg.avisoNube, T) ? nubeAvisoTexto((clients || []).filter(c => !c.archivado).length, (paseos || []).filter(x => x && x.status === "completado").length) : null) : (!(clients || []).length && !(cfg && cfg.avisoNubeEntrar) ? nubeEntrarTexto() : null)), nubeCf: nubeEstado === "conflicto" && !!(nube && nube.ses) }).map(a => (Object.assign(Object.assign({}, a), { col: a.tono === "grn" ? C.grn : C.amb, go: a.k === "nubecf" ? nubeVerConflicto : a.k === "nube" && a.entrar ? () => setCuentaAbierta(true) : a.k === "nube" ? () => { setCfg(c => (Object.assign(Object.assign({}, c), { avisoNube: nubeAvisoMasTarde(c && c.avisoNube, T) }))); setCuentaAbierta(true); } : a.k === "pp" ? () => setPrimeros(p => (Object.assign(Object.assign({}, (p || { inicio: T })), { cerrado: false }))) : a.k === "svc" ? () => { setCfg(c => (Object.assign(Object.assign({}, c), { avisoServicios: true }))); setShowCfg(true); setCfgSecc("servicios"); } : (a.descargar ? () => { doExport(); setShareMsg(null); } : compartirBackup), cerrar: a.k === "nubecf" ? nubeVerConflicto : a.k === "nube" && a.entrar ? () => setCfg(c => (Object.assign(Object.assign({}, c), { avisoNubeEntrar: true }))) : a.k === "nube" ? () => setCfg(c => (Object.assign(Object.assign({}, c), { avisoNube: nubeAvisoMasTarde(c && c.avisoNube, T) }))) : a.k === "pp" ? () => setPrimeros(p => (Object.assign(Object.assign({}, (p || {})), { avisoVisto: true }))) : a.k === "svc" ? () => setCfg(c => (Object.assign(Object.assign({}, c), { avisoServicios: true }))) : () => { setBackupPospuesto(T); setShareMsg(null); } })));
+        nube: !nubeEsLink || (nube && nube.ses) ? null : ((dogs || []).length > 0 ? (nubeAvisoVisible(cfg && cfg.avisoNube, T) ? nubeAvisoTexto((clients || []).filter(c => !c.archivado).length, (paseos || []).filter(x => x && x.status === "completado").length) : null) : (!(clients || []).length && !(cfg && cfg.avisoNubeEntrar) ? nubeEntrarTexto() : null)), nubeCf: nubeEstado === "conflicto" && !!(nube && nube.ses), espacio: avisoEspacio(espacioUsado, LIMITE_ESPACIO, cfg && cfg.avisoEspacio, T) }).map(a => (Object.assign(Object.assign({}, a), { col: a.tono === "grn" ? C.grn : C.amb, go: a.k === "nubecf" ? nubeVerConflicto : a.k === "nube" && a.entrar ? () => setCuentaAbierta(true) : a.k === "nube" ? () => { setCfg(c => (Object.assign(Object.assign({}, c), { avisoNube: nubeAvisoMasTarde(c && c.avisoNube, T) }))); setCuentaAbierta(true); } : a.k === "pp" ? () => setPrimeros(p => (Object.assign(Object.assign({}, (p || { inicio: T })), { cerrado: false }))) : a.k === "svc" ? () => { setCfg(c => (Object.assign(Object.assign({}, c), { avisoServicios: true }))); setShowCfg(true); setCfgSecc("servicios"); } : (a.descargar ? () => { doExport(); setShareMsg(null); } : compartirBackup), cerrar: a.k === "esp" ? () => setCfg(c => (Object.assign(Object.assign({}, c), { avisoEspacio: T }))) : a.k === "nubecf" ? nubeVerConflicto : a.k === "nube" && a.entrar ? () => setCfg(c => (Object.assign(Object.assign({}, c), { avisoNubeEntrar: true }))) : a.k === "nube" ? () => setCfg(c => (Object.assign(Object.assign({}, c), { avisoNube: nubeAvisoMasTarde(c && c.avisoNube, T) }))) : a.k === "pp" ? () => setPrimeros(p => (Object.assign(Object.assign({}, (p || {})), { avisoVisto: true }))) : a.k === "svc" ? () => setCfg(c => (Object.assign(Object.assign({}, c), { avisoServicios: true }))) : () => { setBackupPospuesto(T); setShareMsg(null); } })));
     // La cuenta de la nube: lo mismo en Configuración y en la ventana del ícono de arriba a la derecha.
     const nubeCuentaUI = () => (React.createElement("div", { id: "pc-nube-cfg", style: { padding: "10px 0" } },
         !nubeEsLink ? (React.createElement("div", { style: { fontSize: 13, color: C.mut, lineHeight: 1.5 } }, "Funciona abriendo PaseoCan desde tu link de internet, no desde un archivo.")) : (nube && nube.ses) ? (React.createElement(React.Fragment, null,
@@ -19798,7 +20152,7 @@ function App() {
                             React.createElement("div", { style: { fontSize: 12, color: C.mut, marginTop: 6, textAlign: "center" } }, (TEXT_SCALES.find(x => x[0] === normScale(cfg.textScale)) || TEXT_SCALES[0])[1])))),
                     G("privacidad", "🔒", "Privacidad", cfg.contadorOff ? "No avisa que se usa" : "Avisa de forma anónima que se usa", React.createElement(React.Fragment, null,
                         React.createElement("div", { style: { padding: "10px 0" } },
-                            TIT("Contar que se usa la app", "Una vez por día manda solo un número al azar de este celular, para saber cuánta gente usa PaseoCan, y avisa una sola vez cuando llegás a un primer paso (primer cliente, primer perro, primer paseo, primer cobro). Sin nombre, mail, clientes ni plata."),
+                            TIT("Contar que se usa la app", "Una vez por día manda un número al azar de este celular, para saber cuánta gente usa PaseoCan, junto con cuánto espacio ocupa la app (en %), más o menos cuántos paseos tenés (por ejemplo, entre 100 y 999) y si usás la nube. Además avisa una sola vez cuando llegás a un primer paso (primer cliente, primer perro, primer paseo, primer cobro). Sin nombre, mail, clientes ni plata."),
                             React.createElement("div", { id: "pc-cfg-contador", style: { display: "flex", gap: 6, marginTop: 8 } },
                                 React.createElement("button", { "data-k": "si", onClick: () => setCfg(c => (Object.assign(Object.assign({}, c), { contadorOff: false }))), style: SEG(!cfg.contadorOff) }, "Sí"),
                                 React.createElement("button", { "data-k": "no", onClick: () => setCfg(c => (Object.assign(Object.assign({}, c), { contadorOff: true }))), style: SEG(!!cfg.contadorOff) }, "No"))))),
@@ -20433,10 +20787,15 @@ function App() {
                             React.createElement("span", { style: { minWidth: 0 } },
                                 React.createElement("span", { style: { display: "block", fontSize: 15, fontWeight: 700 } }, item.label),
                                 React.createElement("span", { style: { display: "block", fontSize: 12, color: C.mut, marginTop: 1 } }, item.sub))))),
-                        React.createElement("div", { style: { marginTop: "auto", borderTop: `1px solid ${C.bdr}`, paddingTop: 16 } }, (() => {
-                            const si = textoSinInternet(sinInternet);
-                            return (React.createElement("div", { id: "pc-sin-internet", style: { fontSize: 12, color: si.ok ? C.grn : C.dim, marginBottom: 12, lineHeight: 1.4 } }, si.txt));
-                        })()))))),
+                        React.createElement("div", { style: { marginTop: "auto", borderTop: `1px solid ${C.bdr}`, paddingTop: 16 } },
+                            (() => {
+                                const si = textoSinInternet(sinInternet);
+                                return (React.createElement("div", { id: "pc-sin-internet", style: { fontSize: 12, color: si.ok ? C.grn : C.dim, marginBottom: 12, lineHeight: 1.4 } }, si.txt));
+                            })(),
+                            (() => {
+                                const es = espacioTexto(espacioUsado, LIMITE_ESPACIO);
+                                return (React.createElement("div", { id: "pc-espacio", style: { fontSize: 12, color: es.tono === "red" ? C.red : es.tono === "amb" ? C.amb : C.dim, fontWeight: es.tono === "ok" ? 400 : 700, marginBottom: 12, lineHeight: 1.4 } }, es.txt));
+                            })()))))),
             confReset && (React.createElement("div", { style: { position: "fixed", inset: 0, overflowY: "auto", background: "rgba(0,0,0,.9)", zIndex: 500, display: "flex", alignItems: "center", justifyContent: "center", padding: 24 } },
                 React.createElement("div", { style: { margin: "auto", background: C.card, borderRadius: 20, padding: 28, maxWidth: 340, width: "100%", textAlign: "center", border: `1px solid ${C.bdr}` } },
                     React.createElement("div", { style: { fontWeight: 800, fontSize: 18, color: C.txt, marginBottom: 8 } }, "Reiniciar datos?"),
@@ -20471,6 +20830,28 @@ async function estadoSinInternet() {
     catch (e) {
         return "no_soportado";
     }
+}
+// ── Espacio del celular (21e, revisión de estabilidad, hallazgo 2a) ──
+// Chrome deja guardar 5.242.880 caracteres por sitio (medido). Cuando se llena, lo nuevo deja de guardarse (cartel
+// rojo). La copia de la nube (pc_sync_base) desde el 21/11 vive en IndexedDB (no cuenta acá); si IndexedDB falla vuelve
+// a localStorage y ocupa el doble.
+const LIMITE_ESPACIO = 5242880;
+function espacioPct(usado, limite) { const L = limite || LIMITE_ESPACIO; return Math.max(0, Math.min(100, Math.round((Number(usado) || 0) * 100 / L))); }
+function espacioTexto(usado, limite) {
+    const pct = espacioPct(usado, limite);
+    return { pct, tono: pct >= 90 ? "red" : pct >= 70 ? "amb" : "ok", txt: "💾 Espacio usado en este celular: " + pct + " %" + (pct >= 90 ? ". Casi lleno: guardá un backup y escribime desde Ayuda." : pct >= 70 ? ". Guardá un backup y escribime desde Ayuda." : "") };
+}
+// Aviso en la Agenda desde el 70 %. Cerrado: vuelve a los 7 días (desde el 90 %, al día siguiente).
+function avisoEspacio(usado, limite, pospuesto, hoy) {
+    const pct = espacioPct(usado, limite);
+    if (pct < 70)
+        return null;
+    if (pospuesto) {
+        const vuelve = addDays(pospuesto, pct >= 90 ? 1 : 7);
+        if (hoy < vuelve)
+            return null;
+    }
+    return { pct };
 }
 function textoSinInternet(estado) {
     const T = {
