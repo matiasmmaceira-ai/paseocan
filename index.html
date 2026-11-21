@@ -1254,6 +1254,31 @@ const fmtHs = m => { const h = Math.floor(m / 60), mm = m % 60; return h > 0 ? h
 // guarda como DOS grupos del mismo perro: el viejo queda cerrado (`hasta`, sin días, conserva
 // sus paseos y su tarifa) y el nuevo arranca en `desde` con la config nueva; los paseos con
 // fecha >= desde pasan al grupo nuevo (dgid). Pura: devuelve {dogs,paseos,nuevoId} o null.
+// Sacar a un perro de un grupo (20/11/2026, BUG-098, Matías: "Si perfecto"). Antes se BORRABA el grupo del perro:
+// los paseos hechos quedaban sin saber cuánto valían y la deuda de ese perro desaparecía de Cobros y del encabezado
+// (Cody: Te deben $251.000 → $188.000). Ahora, si el grupo tiene historia (paseos del pasado, hechos, cancelados o
+// cobrados), se CIERRA: sin días, `hasta` el último día trabajado (o ayer) y `dejo:true`. Lo hecho, lo cobrado y lo
+// que debe siguen contando; los paseos que vienen se borran al guardar (guardarPerro). Sin historia, se borra.
+function historiaEnGrupo(paseos, dogId, g, hoy) { return (paseos || []).filter(p => p && p.dogId === dogId && isPaseoDeGrupo(p, g) && (p.fecha < hoy || p.status !== "programado" || (Number(p.pa) || 0) > 0)); }
+function quitarDeGrupo(groups, grpId, paseos, dogId, hoy) {
+    const gs = groups || [];
+    const g = gs.find(x => x && x.id === grpId);
+    if (!g)
+        return gs;
+    const hist = historiaEnGrupo(paseos, dogId, g, hoy);
+    if (!hist.length)
+        return gs.filter(x => x !== g);
+    const ult = hist.reduce((m, p) => p.fecha > m ? p.fecha : m, addDays(hoy, -1));
+    const hasta = g.hasta && g.hasta < ult ? g.hasta : ult;
+    return gs.map(x => x === g ? Object.assign(Object.assign({}, g), { schedule: [], hasta, dejo: true }) : x);
+}
+// Paseos que sobran al guardar un perro: programados SIN plata de un grupo suyo cerrado, después de su último día.
+function sobraDespuesDeCerrar(p, dog) {
+    if (!p || !dog || p.dogId !== dog.id || p.status !== "programado" || (Number(p.pa) || 0) > 0)
+        return false;
+    const g = (dog.groups || []).find(x => x && isPaseoDeGrupo(p, x));
+    return !!(g && g.hasta && p.fecha > g.hasta);
+}
 function partirGrupoDesde(dogs, paseos, dogId, grpId, desde, cambios, nuevoId) {
     const dog = (dogs || []).find(d => d.id === dogId);
     const grp = dog && (dog.groups || []).find(g => g.id === grpId);
@@ -1367,14 +1392,40 @@ const isPaseoDeGrupo = (p, grp) => p.dgid === grp.id || (p.gid === grp.id && !p.
 //   · ausF 0 → su ausDesc cubre todo: el cargo da 0, no queda deuda.
 // Sin ningún "ausente" devuelve el MISMO array: el motor queda byte-idéntico.
 const _normFinCache = new WeakMap();
+// pasadosSinConfirmar (BUG-100 parte B, 21/11/2026): paseos "programado" de días anteriores a hoy, para el aviso
+// de la Agenda. Devuelve los días (más nuevo primero) con sus paseos. Pura.
+function pasadosSinConfirmar(paseos, hoy) {
+    const por = {};
+    (paseos || []).forEach(p => { if (p && p.status === "programado" && p.fecha < hoy)
+        (por[p.fecha] = por[p.fecha] || []).push(p); });
+    return Object.keys(por).sort().reverse().map(f => ({ fecha: f, paseos: por[f] }));
+}
+// DÍA PASADO SIN CONFIRMAR (21/11/2026, Matías: "Dale con A y B"): para la PLATA, un paseo "programado" de
+// un día que ya pasó cuenta como hecho (status "completado", sinConf:true). Antes Stats lo contaba y Cobros
+// no: la deuda de las semanas anteriores desaparecía de Cobros y de "Te deben" (BUG-100, era BUG-050).
+// Solo para las cuentas: el paseo guardado sigue "programado" (la Agenda avisa que falta confirmarlo).
 function normFin(paseos, mDogs, hoy, clients) {
-    if (!Array.isArray(paseos) || !paseos.some(p => p && p.status === "ausente"))
+    if (!Array.isArray(paseos))
         return paseos;
     const H = hoy || td();
+    // POR PASEO: uno ya cobrado (paid) queda como estaba: cada paseo es su propio cobro y un programado cobrado
+    // es un cobro cerrado a propósito (BUG-041). En un ABONO se pasa igual: la unidad es la semana o el mes.
+    const porPaseoCobrado = p => {
+        if (!p.paid)
+            return false;
+        const dog = (mDogs || []).find(d => d.id === p.dogId);
+        const g = dog && (dog.groups || []).find(x => isPaseoDeGrupo(p, x));
+        return !!g && g.billingType !== "fijo_semanal" && g.billingType !== "fijo_mensual";
+    };
+    const pasado = p => p && p.status === "programado" && p.fecha < H && !porPaseoCobrado(p);
+    if (!paseos.some(p => p && (p.status === "ausente" || pasado(p))))
+        return paseos;
     const c = _normFinCache.get(paseos);
     if (c && c.mDogs === mDogs && c.H === H && c.clients === clients)
         return c.out;
     const out = paseos.map(p => {
+        if (pasado(p))
+            return Object.assign(Object.assign({}, p), { status: "completado", sinConf: true });
         if (!p || p.status !== "ausente")
             return p;
         const f = p.ausF == null ? 1 : Math.max(0, Math.min(1, Number(p.ausF) || 0));
@@ -1878,7 +1929,7 @@ function desgloseAtribucion(paseos, mDogs, from, to, congeladas) {
 // Devuelve tambien el excedente (lo cobrado de mas, tambien sin compensar) para
 // que la ecuacion de la tarjeta cierre con las dos cifras del mismo lado:
 //   potencial = dineroRecibido - excedente + perdida + deuda
-function deudaPorCliente(paseos, mDogs, clients, from, to, ajustes, congeladas, ajPeriodo) {
+function deudaPorCliente(paseos, mDogs, clients, from, to, ajustes, congeladas, ajPeriodo, hoy) {
     let total = 0, excedente = 0;
     const porCliente = {}, excePorCliente = {};
     (clients || []).forEach(cl => {
@@ -1889,7 +1940,7 @@ function deudaPorCliente(paseos, mDogs, clients, from, to, ajustes, congeladas, 
         const ps = (paseos || []).filter(p => ids.has(p.dogId));
         if (!ps.length)
             return;
-        const q = buildPeriodoFinanciero(ps, md, [cl], from, to, ajustes, congeladas, ajPeriodo);
+        const q = buildPeriodoFinanciero(ps, md, [cl], from, to, ajustes, congeladas, ajPeriodo, hoy);
         if (q.pendienteCaja > 0.5) {
             total += q.pendienteCaja;
             porCliente[cl.id] = q.pendienteCaja;
@@ -2313,7 +2364,7 @@ function nombreDato(k) { return NOMBRE_DATO[k] || k; }
 // HTML: la base solo deja hacer lo que permiten sus reglas (RLS). NUNCA poner acá la secret/service_role.
 const SUPA_URL = "https://zwuakvfsgesdeiioimcj.supabase.co";
 const SUPA_KEY = "sb_publishable_aIkR9AH_aUigZVcm_eNlKQ_1eMtomWx";
-const APP_VER = "2026-11-20d";
+const APP_VER = "2026-11-21b";
 // Contador anónimo (Matías: "¿vamos a saber cuánta gente la está usando?"): una vez por día que se abre
 // la app, manda SOLO un número al azar de este celular + la versión. Sin nombre, mail ni datos. La
 // tabla `aperturas` solo deja anotar (nadie la lee desde la app). Se apaga en Configuración > Privacidad.
@@ -2336,6 +2387,33 @@ async function contarApertura(fetchFn, { url, key, inst, ver }) {
         const r = await fetchFn(url + "/rest/v1/aperturas", { method: "POST", headers: { apikey: key, "Content-Type": "application/json", Prefer: "return=minimal" }, body: JSON.stringify({ inst, ver }) });
         return !!r && (r.ok || r.status === 409);
     } // 409 = ya contado hoy (otro día del servidor)
+    catch (e) {
+        return false;
+    }
+}
+// ── PRIMEROS PASOS (20/11/2026, Matías: "Medí los primeros pasos"). De 70 celulares que abrieron la app
+// volvieron 3: hay que saber DÓNDE se traban. Cada celular avisa UNA vez cuando llega a cada paso (mismo
+// número al azar del contador, sin nombres ni plata, mismo interruptor de Privacidad). Tabla `pasos`
+// (inst, paso, ya, ver; una fila por celular y paso; solo anotar). `ya` = el paso ya estaba hecho cuando
+// llegó esta versión (usuarios viejos): así no se confunden con los que llegan nuevos.
+const PASOS_APP = [["bienv", "Terminó la bienvenida"], ["cli1", "Cargó su primer cliente"], ["perro1", "Cargó su primer perro"], ["paseo1", "Completó su primer paseo"], ["cobro1", "Registró su primer cobro"], ["cli5", "Tiene 5 clientes o más"]];
+function pasosAlcanzados({ onboardingDone, clients, dogs, paseos, guarderias, adiestramiento }) {
+    const cl = (clients || []).filter(Boolean), ps = (paseos || []).filter(Boolean);
+    const cobro = ps.some(p => (Number(p.pa) || 0) > 0) || (guarderias || []).some(e => e && estadiaPagado(e) > 0) || (adiestramiento || []).some(a => a && adiestraPagado(a) > 0);
+    const ok = { bienv: !!onboardingDone || cl.length > 0, cli1: cl.length > 0, perro1: (dogs || []).filter(Boolean).length > 0, paseo1: ps.some(p => p.status === "completado"), cobro1: cobro, cli5: cl.length >= 5 };
+    return PASOS_APP.map(x => x[0]).filter(k => ok[k]);
+}
+// pasosPorMandar: st = lo guardado en pc_pasos ({base,env}); la primera vez que se mira, lo ya hecho
+// queda como base (ya:true). Devuelve el estado nuevo y lo que falta mandar. Pura.
+function pasosPorMandar(st, alc) {
+    const s = st && Array.isArray(st.env) ? { base: Array.isArray(st.base) ? st.base : [], env: st.env } : { base: alc.slice(), env: [] };
+    return { st: s, mandar: alc.filter(k => !s.env.includes(k)).map(k => ({ paso: k, ya: s.base.includes(k) })) };
+}
+async function enviarPaso(fetchFn, { url, key, inst, paso, ya, ver }) {
+    try {
+        const r = await fetchFn(url + "/rest/v1/pasos", { method: "POST", headers: { apikey: key, "Content-Type": "application/json", Prefer: "return=minimal" }, body: JSON.stringify({ inst, paso, ya: !!ya, ver }) });
+        return !!r && (r.ok || r.status === 409);
+    } // 409 = ese paso ya estaba anotado
     catch (e) {
         return false;
     }
@@ -5128,7 +5206,7 @@ function perdidaFilasVista(pf, ctx, from, to) {
     const sumaDiaAntes = f => { const x = new Date(f + "T12:00:00"); x.setDate(x.getDate() - 1); return x.toISOString().slice(0, 10); };
     const sumaDiaDesp = f => { const x = new Date(f + "T12:00:00"); x.setDate(x.getDate() + 1); return x.toISOString().slice(0, 10); };
     return det.map(r => {
-        if (r.t !== "menos" || !r.dogId || r.desde < from || r.hasta > to)
+        if ((r.t !== "menos" && r.t !== "perdon") || !r.dogId || r.desde < from || r.hasta > to)
             return r;
         const w = wkRange(r.desde);
         if (r.hasta > w.to)
@@ -5143,7 +5221,7 @@ function perdidaFilasVista(pf, ctx, from, to) {
         const cl = (ctx.clients || []).filter(c => c.id === r.cid);
         if (!cl.length)
             return r;
-        const menosDe = (a, b) => (buildPeriodoFinanciero(ctx.paseos || [], ctx.mDogs || [], cl, a, b, ctx.ajustes, ctx.congeladas, ctx.ajPeriodo).perdidaDet || []).reduce((t, x) => t + (x.t === "menos" && x.dogId === r.dogId ? x.m : 0), 0);
+        const menosDe = (a, b) => (buildPeriodoFinanciero(ctx.paseos || [], ctx.mDogs || [], cl, a, b, ctx.ajustes, ctx.congeladas, ctx.ajPeriodo).perdidaDet || []).reduce((t, x) => t + (x.t === r.t && x.dogId === r.dogId ? x.m : 0), 0);
         // W = la semana entera de ese perro (lo que de verdad faltó o sobró); o = el otro pedazo.
         const W = menosDe(w.from, w.to);
         let o = 0;
@@ -5158,7 +5236,7 @@ function perdidaFilasVista(pf, ctx, from, to) {
         return eff === r.m ? r : Object.assign(Object.assign({}, r), { m: eff, semEntera: true });
     });
 }
-const PERD_TIPOS = [["cxl", "Paseos cancelados que no se cobran"], ["desc", "Descuentos al cancelar"], ["aus", "Ausencias o vacaciones"], ["sinserv", "Abono adelantado: semanas sin paseos"], ["menos", "Cobraste menos de lo que valía"], ["ajuste", "Ajustes del período"], ["descEst", "Descuentos de estadías"], ["descCla", "Descuentos de clases"]];
+const PERD_TIPOS = [["cxl", "Paseos cancelados que no se cobran"], ["desc", "Descuentos al cancelar"], ["aus", "Ausencias o vacaciones"], ["sinserv", "Abono adelantado: semanas sin paseos"], ["perdon", "No se la cobraste (dejó de venir)"], ["menos", "Cobraste menos de lo que valía"], ["ajuste", "Ajustes del período"], ["descEst", "Descuentos de estadías"], ["descCla", "Descuentos de clases"]];
 const CXL_POR = { client: "canceló el cliente", me: "cancelaste vos", feriado: "feriado", clima: "clima" };
 function detallePerdida(pf, mDogs, clients, ctx, from, to) {
     const det = perdidaFilasVista(pf, ctx, from, to);
@@ -5168,9 +5246,9 @@ function detallePerdida(pf, mDogs, clients, ctx, from, to) {
     const filas = [];
     const menos = {};
     det.forEach(x => {
-        if (x.t === "menos") {
-            const k = x.dogId || x.cid;
-            (menos[k] = menos[k] || { t: "menos", dogId: x.dogId, cid: x.cid, m: 0, desdes: [] }).m += x.m;
+        if (x.t === "menos" || x.t === "perdon") {
+            const k = x.t + ":" + (x.dogId || x.cid);
+            (menos[k] = menos[k] || { t: x.t, dogId: x.dogId, cid: x.cid, m: 0, desdes: [] }).m += x.m;
             menos[k].desdes.push(x.desde);
             return;
         }
@@ -5185,7 +5263,7 @@ function detallePerdida(pf, mDogs, clients, ctx, from, to) {
         filas.push({ t: x.t, nombre: x.dogId ? perro(x.dogId) : cliente(x.cid), cuando: cuando(x), m: x.m, sub: sub.join(" · "), orden: x.desde });
     });
     Object.values(menos).forEach(x => { if (Math.round(x.m))
-        filas.push({ t: x.m > 0 ? "menos" : "mas", nombre: x.dogId ? perro(x.dogId) : cliente(x.cid), cuando: "", m: x.m, sub: "", orden: x.desdes.sort()[0] }); });
+        filas.push({ t: x.m > 0 ? x.t : "mas", nombre: x.dogId ? perro(x.dogId) : cliente(x.cid), cuando: "", m: x.m, sub: "", orden: x.desdes.sort()[0] }); });
     // Descuentos de estadías y clases (30/10/2026): mismos números que buildEstadiaPeriodo/buildAdiestraPeriodo.
     if (ctx && from && to) {
         (ctx.guarderias || []).map(ensureEstadia).filter(e => e.estado !== "cancelada" && estadiaEnPeriodo(e, from, to) && estadiaDescuento(e) > 0)
@@ -8805,8 +8883,14 @@ function diasAgendados(schedule, desde, hasta) {
             out.push(ds(d.getFullYear(), d.getMonth(), d.getDate()));
     return out;
 }
-function bajaPlan(cid, mDogs, paseos, ultimo) {
-    const dogs = (mDogs || []).filter(d => d && d.cid === cid);
+// dogId (BUG-098, 20/11/2026): la baja de UN perro ("Dejó de venir"); sin dogId, todos los del cliente.
+const esDeBaja = (d, cid, dogId) => !!d && d.cid === cid && (!dogId || d.id === dogId);
+// desc (BUG-099, 20/11/2026, Matías: "Hacelo como me dijiste. El otro monto es el que se cobra"): el % de
+// descuento del cliente. El plan guarda PRECIOS (entero, prop: sin descuento, como el tramo de historialPrecios);
+// el cartel muestra y pide LO QUE PAGA (netoBaja). "Otro monto" = lo que paga → precioDeNeto. Lo pagado ya es
+// neto: se compara contra el neto.
+function bajaPlan(cid, mDogs, paseos, ultimo, dogId, desc) {
+    const dogs = (mDogs || []).filter(d => esDeBaja(d, cid, dogId));
     const grupos = [];
     dogs.forEach(d => gruposReales(d).filter(g => enVigenciaGrupo(g, ultimo)).forEach(g0 => {
         const g = ensureGrupo(g0);
@@ -8820,7 +8904,7 @@ function bajaPlan(cid, mDogs, paseos, ultimo) {
         const entero = precioFijo(g, ini);
         // pagado: lo que ya entró de ESE período de ese perro/abono ("manda el día del cobro": pa en el período).
         const pagado = (paseos || []).filter(p => p && p.dogId === d.id && (!p.dgid || p.dgid === g.id) && p.fecha >= ini && p.fecha <= fin).reduce((s, p) => s + (Number(p.pa) || 0), 0);
-        grupos.push({ dogId: d.id, perro: d.name, grpId: g.id, men, ini, fin, entero, dias: hechos, diasTot: tot, prop: tot ? Math.round(entero * hechos / tot) : entero, pagado });
+        grupos.push({ dogId: d.id, perro: d.name, grpId: g.id, men, ini, fin, entero, desc: Math.max(0, Number(desc) || 0), dias: hechos, diasTot: tot, prop: tot ? Math.round(entero * hechos / tot) : entero, pagado });
     }));
     const ids = new Set(dogs.map(d => d.id));
     const cancelar = (paseos || []).filter(p => p && ids.has(p.dogId) && p.fecha > ultimo && p.status !== "completado" && p.status !== "cancelado" && !(p.pa > 0)).length;
@@ -8835,11 +8919,11 @@ function montoBaja(x, el) { if (!x)
 // aFavorBaja (08/11/2026, Matías: "si cualquier cliente tiene plata a favor cuando deja el servicio, se
 // pregunta qué pasa con eso"): plata ya entrada en paseos DESPUÉS del último día que no son del período
 // de ese día (de eso se ocupa deMasBaja): pagos adelantados, o un descuento "del próximo cobro". Pura.
-function aFavorBaja(cid, mDogs, paseos, ultimo) {
+function aFavorBaja(cid, mDogs, paseos, ultimo, dogId) {
     const out = { total: 0, ids: [] };
     if (!ultimo)
         return out;
-    const dogs = (mDogs || []).filter(d => d && d.cid === cid);
+    const dogs = (mDogs || []).filter(d => esDeBaja(d, cid, dogId));
     (paseos || []).forEach(p => {
         if (!p || !(p.fecha > ultimo) || !((Number(p.pa) || 0) > 0) || p.status === "completado" || p.status === "cancelado")
             return;
@@ -8858,17 +8942,32 @@ function aFavorBaja(cid, mDogs, paseos, ultimo) {
     return out;
 }
 function deMasBaja(x, el) { if (!x)
-    return 0; const m = montoBaja(x, el); return Math.max(0, (Number(x.pagado) || 0) - (m == null ? x.entero : m)); }
+    return 0; const m = montoBaja(x, el); return Math.max(0, (Number(x.pagado) || 0) - netoBaja(x, m == null ? x.entero : m)); }
+// netoBaja: lo que paga por un precio (con el descuento del cliente, igual que Cobros: Math.round).
+// precioDeNeto: el precio (entero) que, con el descuento, da justo ese neto ("Otro monto" SIN descuento). Puras.
+function netoBaja(x, precio) { const d = (x && Number(x.desc)) || 0; const v = Math.max(0, Number(precio) || 0); return d > 0 ? Math.round(v * (1 - d / 100)) : v; }
+function precioDeNeto(x, neto) {
+    const d = (x && Number(x.desc)) || 0;
+    const n = Math.max(0, Math.round(Number(neto) || 0));
+    if (!(d > 0) || d >= 100)
+        return n;
+    let b = Math.round(n / (1 - d / 100));
+    for (let i = 0; i < 4 && netoBaja(x, b) < n; i++)
+        b++;
+    for (let i = 0; i < 4 && netoBaja(x, b - 1) >= n && b > 0; i++)
+        b--;
+    return b;
+}
 // aplicarBaja(…,plata): plata = {grpId:"devuelvo"|"quedo"} para lo que pagó de más. "quedo" → el período vale
 // lo que pagó (sin pasar el entero); "devuelvo" → se le descuenta a lo cobrado de ese período (de los
 // pagos más nuevos para atrás) y queda anotado para poder deshacer.
-function aplicarBaja(dogs, paseos, cid, ultimo, elecciones, plan, hoy, plata) {
+function aplicarBaja(dogs, paseos, cid, ultimo, elecciones, plan, hoy, plata, dogId) {
     const cambios = [], cambiosPa = [];
     const porGrp = {};
     (plan && plan.grupos || []).forEach(x => { porGrp[x.grpId] = x; });
     let pas = paseos || [];
     const nd = (dogs || []).map(d => {
-        if (!d || d.cid !== cid)
+        if (!esDeBaja(d, cid, dogId))
             return d;
         return Object.assign(Object.assign({}, d), { groups: (d.groups || []).map(g => {
                 if (!g || g.suelto || !enVigenciaGrupo(g, ultimo) && !(g.desde && g.desde > ultimo))
@@ -8883,7 +8982,7 @@ function aplicarBaja(dogs, paseos, cid, ultimo, elecciones, plan, hoy, plata) {
                 let monto = montoBaja(x, el);
                 const dm = deMasBaja(x, el), pl = (plata || {})[g.id];
                 if (x && dm > 0 && pl === "quedo")
-                    monto = montoBaja(x, Number(x.pagado) || 0);
+                    monto = montoBaja(x, precioDeNeto(x, Number(x.pagado) || 0));
                 if (x && dm > 0 && pl === "devuelvo") {
                     let falta = dm;
                     const mios = pas.filter(p => p && p.dogId === d.id && (!p.dgid || p.dgid === g.id) && p.fecha >= x.ini && p.fecha <= x.fin && (Number(p.pa) || 0) > 0).sort((a, b) => b.fecha.localeCompare(a.fecha));
@@ -8897,13 +8996,13 @@ function aplicarBaja(dogs, paseos, cid, ultimo, elecciones, plan, hoy, plata) {
                 return ng;
             }) });
     });
-    const ids = new Set((dogs || []).filter(d => d && d.cid === cid).map(d => d.id));
+    const ids = new Set((dogs || []).filter(d => esDeBaja(d, cid, dogId)).map(d => d.id));
     // Plata a favor por delante (aFavorBaja): "devuelvo" → se borra de esos pagos (la caja baja);
     // "quedo" → pasa al último paseo hasta ese día (queda como cobrado de más). Se puede deshacer (cambiosPa).
     const af = (plata || {})._aFavor;
     const favAntes = [];
     if (af === "devuelvo" || af === "quedo") {
-        const fav = aFavorBaja(cid, (dogs || []).map(migDog), pas, ultimo);
+        const fav = aFavorBaja(cid, (dogs || []).map(migDog), pas, ultimo, dogId);
         if (fav.total > 0) {
             const set = new Set(fav.ids);
             let recibe = null;
@@ -8932,11 +9031,15 @@ function aplicarBaja(dogs, paseos, cid, ultimo, elecciones, plan, hoy, plata) {
     return { dogs: nd, paseos: np, baja: Object.assign({ ultimo, el: hoy || td(), elecciones: elecciones || {}, plata: plata || {}, cambios, cambiosPa }, (favAntes.length ? { favAntes } : {})) };
 }
 // eleccionesBaja: pasa las elecciones del cartel al motor ("monto" se convierte en el número escrito). Pura.
-function eleccionesBaja(elecciones, montos) {
+// "Otro monto" es lo que PAGA: se guarda el precio que con su descuento da justo ese monto (plan: el descuento
+// de cada abono; sin plan o sin descuento, el monto tal cual).
+function eleccionesBaja(elecciones, montos, plan) {
     const o = {};
     Object.keys(elecciones || {}).forEach(k => {
         const el = elecciones[k];
-        o[k] = el === "monto" ? Math.max(0, parseInt((montos || {})[k], 10) || 0) : el;
+        const m = Math.max(0, parseInt((montos || {})[k], 10) || 0);
+        const x = ((plan && plan.grupos) || []).find(g => g.grpId === k);
+        o[k] = el === "monto" ? (x ? precioDeNeto(x, m) : m) : el;
     });
     return o;
 }
@@ -8944,8 +9047,8 @@ function eleccionesBaja(elecciones, montos) {
 // otrosDeBaja: lo que el cliente tiene programado DESPUÉS del último día y la baja (que solo cerraba los
 // paseos) dejaba colgado: estadías programadas que empiezan después, y series con clases por dar. Para
 // las clases se calcula lo que pagó de más si se quitan las que faltan. Pura.
-function otrosDeBaja(cid, mDogs, guarderias, adiestramiento, ultimo) {
-    const dogs = (mDogs || []).filter(d => d && d.cid === cid);
+function otrosDeBaja(cid, mDogs, guarderias, adiestramiento, ultimo, dogId) {
+    const dogs = (mDogs || []).filter(d => esDeBaja(d, cid, dogId));
     const nom = id => (dogs.find(d => d.id === id) || {}).name || "";
     const ids = new Set(dogs.map(d => d.id));
     if (!ultimo)
@@ -9000,6 +9103,51 @@ function deshacerOtrosBaja(guarderias, adiestramiento, baja) {
     const m = {};
     ((baja && baja.otrosAntes) || []).forEach(x => { m[x.tipo + ":" + x.id] = x.obj; });
     return { guarderias: (guarderias || []).map(e => e && m["est:" + e.id] ? m["est:" + e.id] : e), adiestramiento: (adiestramiento || []).map(a => a && m["cla:" + a.id] ? m["cla:" + a.id] : a) };
+}
+// deudaPerroBaja (BUG-098, 20/11/2026): lo que te queda debiendo el cliente por paseos de ESE perro
+// (lo mismo que suma su tarjeta de Cobros esta semana, solo con ese perro y sin ajustes del cliente).
+// Se calcula sobre el resultado de la baja: refleja lo que se eligió para el período. Pura.
+function deudaPerroBaja({ clients, mDogs, paseos, cid, dogId, hoy, congeladas }) {
+    const cl = (clients || []).find(c => c && c.id === cid);
+    const md = (mDogs || []).filter(d => d && d.id === dogId && d.cid === cid);
+    if (!cl || !md.length)
+        return 0;
+    const w = wkRange(hoy || td());
+    const f = quienTeDebe({ clients: [cl], mDogs: md, paseos, guarderias: [], adiestramiento: [], from: w.from, to: w.to, ajustes: {}, congeladas, ajPeriodo: {} }).porCid[cid];
+    return f ? Math.round(f.paseos || 0) : 0;
+}
+// perdonarDeudaPerro (BUG-098 parte 2b, 20/11/2026, Matías: "No se la cobro → Perdiste"): lo que el perro
+// quedó debiendo hasta el último día deja de deberse. Cada paseo hecho (o cancelado que se cobra) sin
+// cobrar queda paid:true + perdon:true, SIN plata: Cobros y el encabezado ya no lo ven como impago
+// (isCompImpago) y Stats cierra el período en lo cobrado (guarda `pa>0||perdon`) → la diferencia va a
+// Perdiste. La caja no se mueve. No toca el período en curso que decide la baja (plan.grupos: ahí
+// manda "No se cobra / Otro monto / Entero"). Devuelve los cambios para deshacer. Pura.
+// hoy (21/11/2026, BUG-100): un programado de un día que ya pasó cuenta como hecho para la plata, así que
+// también se perdona (sigue "programado" en la Agenda, marcado sin plata).
+function perdonarDeudaPerro(paseos, dogId, ultimo, plan, hoy) {
+    const H = hoy || td();
+    const per = (plan && plan.grupos || []).filter(x => x.dogId === dogId);
+    const cambios = [];
+    const enCurso = p => per.some(x => (!p.dgid || p.dgid === x.grpId) && p.fecha >= x.ini && p.fecha <= x.fin);
+    const out = (paseos || []).map(p => {
+        if (!p || p.dogId !== dogId || !ultimo || p.fecha > ultimo || p.paid)
+            return p;
+        if (p.status !== "completado" && !cxlCobrable(p) && !(p.status === "programado" && p.fecha < H))
+            return p;
+        if (enCurso(p))
+            return p;
+        cambios.push({ id: p.id, paid: p.paid });
+        return Object.assign(Object.assign({}, p), { paid: true, perdon: true });
+    });
+    return { paseos: out, cambios };
+}
+function deshacerPerdon(paseos, cambios) {
+    const m = {};
+    (cambios || []).forEach(x => { m[x.id] = x; });
+    if (!Object.keys(m).length)
+        return paseos;
+    return (paseos || []).map(p => { if (!p || !m[p.id] || !p.perdon)
+        return p; const { perdon } = p, r = __rest(p, ["perdon"]); return Object.assign(Object.assign({}, r), { paid: !!m[p.id].paid }); });
 }
 // deshacerBajaPaseos: si se devolvió plata, los cobros vuelven a como estaban. Pura.
 function deshacerBajaPaseos(paseos, baja) {
@@ -9342,8 +9490,8 @@ function buildStatsViewModel({ clients, mDogs, paseos, selWk, selMo, hoy, congel
 // predicados centralizados de S2 (isPaseoDeGrupo / isCompImpago).
 // Recibe la misma semana visualizada (wk) que ve el header.
 // Devuelve un objeto para dejar lugar a futuros totales sin romper el call site.
-function buildHeaderTotals(paseos, mDogs, clients, wk, congeladas, ajustes, ajPeriodo) {
-    paseos = normFin(paseos, mDogs, undefined, clients);
+function buildHeaderTotals(paseos, mDogs, clients, wk, congeladas, ajustes, ajPeriodo, hoy) {
+    paseos = normFin(paseos, mDogs, hoy, clients);
     // Se arma CLIENTE por cliente, como la ficha de Cobros: sus cargos de la semana + sus ajustes
     // (25/10/2026, BUG-042: antes "Te deben" ignoraba los ajustes). Sin ajustes da lo de siempre.
     const porCli = {};
@@ -9438,8 +9586,10 @@ function buildHeaderTotals(paseos, mDogs, clients, wk, congeladas, ajustes, ajPe
 //   Stats semana         → usa dineroRecibido / pendienteCaja
 //   Stats mes            → usa ingresosDevengados / pendienteDevengo
 //   wkPend (Home)        → sigue usando calcWCharge (semántica distinta: deuda semana)
-function buildPeriodoFinanciero(paseos, mDogs, clients, from, to, ajustes, congeladas, ajPeriodo) {
-    paseos = normFin(paseos, mDogs, undefined, clients);
+// hoy (opcional, 21/11/2026): el día desde el que un programado sin confirmar cuenta como hecho (normFin). Sin
+// pasarlo, es hoy de verdad.
+function buildPeriodoFinanciero(paseos, mDogs, clients, from, to, ajustes, congeladas, ajPeriodo, hoy) {
+    paseos = normFin(paseos, mDogs, hoy, clients);
     // 1) Paseos del período
     const pp = paseos.filter(p => p.fecha >= from && p.fecha <= to);
     // 2) Semanas que intersectan el período (para bucketing de calcCobro)
@@ -9525,7 +9675,8 @@ function buildPeriodoFinanciero(paseos, mDogs, clients, from, to, ajustes, conge
                     porCxl = Math.min(Math.max((potencial - pot0) - vR, 0), dif);
                 }
                 anotaPerd("cxl", dog, sem.from, sem.to, porCxl, wp);
-                anotaPerd("menos", dog, sem.from, sem.to, dif - porCxl, []);
+                // "No se la cobro" (perdon, BUG-098 2b): lo que faltaba es deuda perdonada, no "cobraste menos".
+                anotaPerd(wp.some(p => p.perdon) ? "perdon" : "menos", dog, sem.from, sem.to, dif - porCxl, []);
             }
             else {
                 const wpReal = wp.map(p => p.status === "programado" ? Object.assign(Object.assign({}, p), { status: "completado" }) : p);
@@ -9590,7 +9741,9 @@ function buildPeriodoFinanciero(paseos, mDogs, clients, from, to, ajustes, conge
                     // Si todos los completados estan marcados pero no entro un peso, es un
                     // IMPAGO, no un descuento del 100%: sin este guard el mes se leia como
                     // saldado en cero y el cliente figuraba AL DIA sin haber pagado.
-                    const saldadaMes = complMes.length > 0 && complMes.every(p => p.paid) && complMes.some(p => (p.pa || 0) > 0);
+                    // p.perdon (BUG-098 2b, 20/11/2026): "No se la cobro" al dejar de venir. Marcado sin plata A
+                    // PROPÓSITO: el período queda cerrado en lo cobrado y lo que faltaba va a Perdiste.
+                    const saldadaMes = complMes.length > 0 && complMes.every(p => p.paid) && complMes.some(p => (p.pa || 0) > 0 || p.perdon);
                     const real0 = real;
                     if (saldadaMes) {
                         real += complMes.reduce((s, p) => s + (p.pa || 0), 0);
@@ -9598,7 +9751,7 @@ function buildPeriodoFinanciero(paseos, mDogs, clients, from, to, ajustes, conge
                     else {
                         real += Math.max(cobroMes - ausDescSum(mp), 0); // ausencia: ver pasada 3c
                     }
-                    anotaPerd(saldadaMes ? "menos" : "aus", dog, mk + "-01", finDeMes(mk), cobroMes - (real - real0), []);
+                    anotaPerd(saldadaMes ? (mp.some(p => p.perdon) ? "perdon" : "menos") : "aus", dog, mk + "-01", finDeMes(mk), cobroMes - (real - real0), []);
                 }
             }
             fd = addMos(moKey(fd), 1) + "-01";
@@ -9652,7 +9805,7 @@ function buildPeriodoFinanciero(paseos, mDogs, clients, from, to, ajustes, conge
             // "Restante al cierre" nunca bajaba para fijo_semanal/mensual, aunque la
             // ficha del cliente sí lo reconociera bien (via buildClientFinancials).
             const complSem = wpFull.filter(p => p.status === "completado");
-            const saldadaSem = complSem.length > 0 && complSem.every(p => p.paid) && complSem.some(p => (p.pa || 0) > 0); // ver nota en saldadaMes: marcada sin plata = impago, no descuento total
+            const saldadaSem = complSem.length > 0 && complSem.every(p => p.paid) && complSem.some(p => (p.pa || 0) > 0 || p.perdon); // ver nota en saldadaMes: marcada sin plata = impago, no descuento total
             // Adelantado con TODOS los paseos cancelados y ninguno programado: no hay
             // servicio que prestar, así que el abono no se cobra (coherente con
             // calcWCharge, que exige hayProgramados). El potencial ya sumó el abono
@@ -9675,7 +9828,7 @@ function buildPeriodoFinanciero(paseos, mDogs, clients, from, to, ajustes, conge
                 // Saldada no lo necesita: en una ausencia se guarda la plata NETA que entró.
                 real += Math.max(abono - ausDescSum(wpFull), 0);
             }
-            anotaPerd(adelTodoCxl ? "sinserv" : saldadaSem ? "menos" : "aus", dog, w.from, w.to, abono - (real - real0), adelTodoCxl ? wpFull : []);
+            anotaPerd(adelTodoCxl ? "sinserv" : saldadaSem ? (wpFull.some(p => p.perdon) ? "perdon" : "menos") : "aus", dog, w.from, w.to, abono - (real - real0), adelTodoCxl ? wpFull : []);
         });
     }));
     // 3d) Ajustes MANUALES por evento (estrategia B). Se aplican al final, después
@@ -9695,7 +9848,7 @@ function buildPeriodoFinanciero(paseos, mDogs, clients, from, to, ajustes, conge
             const w = wkRange(f);
             const per = paseos.filter(x => x.dogId === dog.id && isPaseoDeGrupo(x, grp) && (men ? moKey(x.fecha) === moKey(f) : (x.fecha >= w.from && x.fecha <= w.to)));
             const c = per.filter(x => x.status === "completado");
-            return c.length > 0 && c.every(x => x.paid) && c.some(x => (x.pa || 0) > 0);
+            return c.length > 0 && c.every(x => x.paid) && c.some(x => (x.pa || 0) > 0 || x.perdon);
         };
         // A qué período va un ajuste (descuento de un cancelado o día extra): al de SU semana,
         // que cae donde cae el cobro (anclaSemana; mensual: anclaMensual). Regla de Matías
@@ -10366,6 +10519,24 @@ function PagoDeMas({ monto, onElegir, onCancel }) {
             op("quedo", "💰 Me la quedo", "Se cobra la estadía como estaba. Queda pagada."),
             React.createElement("button", { className: "pc-demas-cancelar", onClick: onCancel, style: Object.assign(Object.assign({}, BR("secundario", false)), { width: "100%", marginTop: 4 }) }, "Volver a editar"))));
 }
+// Antes de eliminar un perro (20/11/2026, Matías: "Si"): eliminar borra TODOS sus paseos, también los hechos y
+// cobrados, y esa plata sale de Cobros y Stats. El cartel viejo decía solo "Se eliminan sus paseos". Ahora dice
+// cuánto se pierde y ofrece primero lo que conserva todo. Cobrado = plata que entró (pa menos lo absorbido).
+function resumenBorrarPerro(paseos, dogId, hoy) {
+    let hechos = 0, cobrado = 0, futuros = 0;
+    (paseos || []).forEach(p => {
+        if (!p || p.dogId !== dogId)
+            return;
+        if (p.status === "completado")
+            hechos++;
+        const n = (Number(p.pa) || 0) - (Number(p.descAplicado) || 0);
+        if (n > 0)
+            cobrado += n;
+        if (p.status === "programado" && (p.fecha || "") >= hoy)
+            futuros++;
+    });
+    return { hechos, cobrado, futuros, pierde: hechos > 0 || cobrado > 0 };
+}
 function Confirm({ title, sub, onOk, onCancel, danger, aviso, bloqueado }) {
     return (React.createElement("div", { style: { position: "fixed", inset: 0, overflowY: "auto", background: "rgba(0,0,0,.8)", zIndex: 300, display: "flex", alignItems: "center", justifyContent: "center", padding: 24 } },
         React.createElement("div", { style: { margin: "auto", background: C.card, borderRadius: 20, padding: 28, maxWidth: 340, width: "100%", textAlign: "center", border: `1px solid ${C.bdr}` } },
@@ -10746,7 +10917,7 @@ function GrpEd({ grp, globalGroups, onChange, onRemove, alta, abiertoIni, habitu
                     " - ",
                     grp.billingType === "fijo_mensual" ? $(grp.fixedAmount || 0) + "/mes, " + (grp.billingTiming === "adelantado" ? "a principio de mes" : "a fin de mes") : grp.billingType === "fijo_semanal" ? $(grp.fixedAmount || 0) + "/sem, " + (grp.billingTiming === "adelantado" ? "al principio" : "al final") : grp.unitPrice > 0 ? $(grp.unitPrice) + "/paseo" : "sin precio"),
                 grpSinPrecio(grp) && React.createElement("div", { style: { fontSize: 12, color: C.amb, fontWeight: 700, marginTop: 2 } }, "Falta cargar el precio"),
-                grp.hasta && React.createElement("div", { style: { fontSize: 12, color: C.amb, fontWeight: 700, marginTop: 2 } }, (grp.hasta >= td() ? "Tarifa actual, sigue hasta el " : "Tarifa anterior, hasta el ") + grp.hasta.slice(8, 10) + "/" + grp.hasta.slice(5, 7) + "/" + grp.hasta.slice(0, 4) + (grp.hasta >= td() ? "" : " (guarda sus cobros)")),
+                grp.hasta && React.createElement("div", { style: { fontSize: 12, color: C.amb, fontWeight: 700, marginTop: 2 } }, (grp.dejo ? "Dejó de salir, último día " : grp.hasta >= td() ? "Tarifa actual, sigue hasta el " : "Tarifa anterior, hasta el ") + grp.hasta.slice(8, 10) + "/" + grp.hasta.slice(5, 7) + "/" + grp.hasta.slice(0, 4) + (grp.hasta >= td() ? "" : " (guarda sus cobros)")),
                 grp.desde && grp.desde > td() && React.createElement("div", { style: { fontSize: 12, color: "#60a5fa", fontWeight: 700, marginTop: 2 } }, "Empieza el " + grp.desde.slice(8, 10) + "/" + grp.desde.slice(5, 7) + "/" + grp.desde.slice(0, 4)),
                 grp.desde && React.createElement("div", { style: { fontSize: 12, color: C.grn, fontWeight: 700, marginTop: 2 } }, "Desde el " + grp.desde.slice(8, 10) + "/" + grp.desde.slice(5, 7) + "/" + grp.desde.slice(0, 4)),
                 !open && !grp.hasta && React.createElement("div", { style: { fontSize: 13, color: "#60a5fa", fontWeight: 800, marginTop: 6 } }, "Cambiar días o precio ›")),
@@ -10792,7 +10963,7 @@ function GrpEdLinea({ grp, globalGroups, onChange, onRemove, foco }) {
     const nombre = ((g0 && g0.name) || grp.name || "Grupo").trim();
     const dmy = f => f.slice(8, 10) + "/" + f.slice(5, 7) + "/" + f.slice(0, 4);
     if (grp.hasta)
-        return (React.createElement("div", { className: "pc-grp-viejo", style: { padding: "8px 12px", borderRadius: 12, border: `1px dashed ${C.bdr}`, marginBottom: 8, fontSize: 12, color: C.mut } }, grp.hasta >= td() ? (nombre + " · tarifa actual (" + tarifaTxt(grp) + "), sigue hasta el " + dmy(grp.hasta) + ". Después rige la de abajo.") : (nombre + " · tarifa anterior, hasta el " + dmy(grp.hasta) + " (guarda sus cobros)")));
+        return (React.createElement("div", { className: "pc-grp-viejo", style: { padding: "8px 12px", borderRadius: 12, border: `1px dashed ${C.bdr}`, marginBottom: 8, fontSize: 12, color: C.mut } }, grp.dejo ? (nombre + " · dejó de salir, último día " + dmy(grp.hasta) + " (guarda lo hecho, lo cobrado y lo que debe)") : grp.hasta >= td() ? (nombre + " · tarifa actual (" + tarifaTxt(grp) + "), sigue hasta el " + dmy(grp.hasta) + ". Después rige la de abajo.") : (nombre + " · tarifa anterior, hasta el " + dmy(grp.hasta) + " (guarda sus cobros)")));
     const val = opcionCobroLinea(grp);
     const selector = (React.createElement("select", { className: "pc-grp-cobro", value: val, onChange: e => onChange(aplicarCobroLinea(grp, e.target.value)), style: Object.assign(Object.assign({}, INP), { flex: 1, minWidth: 0, padding: "9px 6px", fontSize: 12 }) }, COBRO_LINEA.map(([k, l]) => (React.createElement("option", { key: k, value: k }, l)))));
     return (React.createElement("div", { ref: ref, className: "pc-grp-linea", "data-mid": grp.id, style: { background: C.card, borderRadius: 14, border: `1.5px solid ${foco ? C.grn : C.bdr}`, padding: "10px 12px", marginBottom: 8, scrollMarginTop: 16 } },
@@ -10820,7 +10991,7 @@ function GrpEdLinea({ grp, globalGroups, onChange, onRemove, foco }) {
             selector)) : (React.createElement(PrecioFijoEd, { grp: grp, onChange: onChange, unidad: val === "mes_ini" || val === "mes_fin" ? "mes" : "sem", extra: selector, compacto: true }))),
         grpSinPrecio(grp) && React.createElement("div", { style: { fontSize: 12, color: C.amb, fontWeight: 700, marginTop: 6 } }, "Falta cargar el precio")));
 }
-function DogGrpsEd({ draft, set, gg, setGG, cfg, embebido, abierto, habitual, enLinea, foco, sinTitulo }) {
+function DogGrpsEd({ draft, set, gg, setGG, cfg, embebido, abierto, habitual, enLinea, foco, sinTitulo, paseos }) {
     const [showPicker, setShowPicker] = useState(false);
     // abierto: arranca desplegado (alta de perro, 25/10/2026: plegado había que acordarse de abrirlo).
     const [open, setOpen] = useState(!!abierto);
@@ -10874,7 +11045,7 @@ function DogGrpsEd({ draft, set, gg, setGG, cfg, embebido, abierto, habitual, en
                 React.createElement("div", { style: { fontSize: 12, color: C.mut, marginTop: 8 } }, "Después podés definir su recorrido desde Agenda."))))),
         React.createElement("div", { style: { marginTop: 10 } },
             !gruposReales(draft).length && React.createElement("div", { style: { fontSize: 13, color: C.mut, textAlign: "center", padding: "8px 0" } }, "Sin grupos"),
-            (draft.groups || []).map((g, i) => [g, i]).sort((x, y) => enLinea ? ((x[0] && x[0].hasta ? 1 : 0) - (y[0] && y[0].hasta ? 1 : 0)) : 0).map(([g, i]) => g && g.suelto ? null : enLinea ? (React.createElement(GrpEdLinea, { key: g.id, grp: g, globalGroups: gg, foco: (!!foco && foco === g.id) || g.id === recien, onChange: upd => { const gs = [...(draft.groups || [])]; gs[i] = upd; set(d => (Object.assign(Object.assign({}, d), { groups: gs }))); }, onRemove: () => set(d => (Object.assign(Object.assign({}, d), { groups: (d.groups || []).filter((_, j) => j !== i) }))) })) : (React.createElement(GrpEd, { key: g.id, grp: g, globalGroups: gg, alta: !!abierto, abiertoIni: g.id === recien, habitual: habitual, onChange: upd => { const gs = [...(draft.groups || [])]; gs[i] = upd; set(d => (Object.assign(Object.assign({}, d), { groups: gs }))); }, onRemove: () => set(d => (Object.assign(Object.assign({}, d), { groups: (d.groups || []).filter((_, j) => j !== i) }))) }))))));
+            (draft.groups || []).map((g, i) => [g, i]).sort((x, y) => enLinea ? ((x[0] && x[0].hasta ? 1 : 0) - (y[0] && y[0].hasta ? 1 : 0)) : 0).map(([g, i]) => g && g.suelto ? null : enLinea ? (React.createElement(GrpEdLinea, { key: g.id, grp: g, globalGroups: gg, foco: (!!foco && foco === g.id) || g.id === recien, onChange: upd => { const gs = [...(draft.groups || [])]; gs[i] = upd; set(d => (Object.assign(Object.assign({}, d), { groups: gs }))); }, onRemove: () => set(d => (Object.assign(Object.assign({}, d), { groups: quitarDeGrupo(d.groups, g.id, paseos, d.id, td()) }))) })) : (React.createElement(GrpEd, { key: g.id, grp: g, globalGroups: gg, alta: !!abierto, abiertoIni: g.id === recien, habitual: habitual, onChange: upd => { const gs = [...(draft.groups || [])]; gs[i] = upd; set(d => (Object.assign(Object.assign({}, d), { groups: gs }))); }, onRemove: () => set(d => (Object.assign(Object.assign({}, d), { groups: quitarDeGrupo(d.groups, g.id, paseos, d.id, td()) }))) }))))));
     if (embebido)
         return cuerpo;
     return (React.createElement("div", { style: { background: C.cl, borderRadius: 12, border: `1px solid ${C.bdr}` } },
@@ -11527,6 +11698,28 @@ function Agenda({ svc, avisosApp, setWaTpl, partes, setPartes, paseos, setPaseos
     }, [adiestramiento, T, dogs]);
     // Vacunas vencidas o por vencer (15 días) de los perros activos.
     const [verVacTodos, setVerVacTodos] = useState(false);
+    // Paseos de días anteriores sin confirmar (BUG-100 B): ya cuentan para la plata; el aviso pide confirmarlos
+    // o cancelar los que no se hicieron.
+    const sinConf = useMemo(() => pasadosSinConfirmar(paseos, T), [paseos, T]);
+    const sinConfN = sinConf.reduce((s, d) => s + d.paseos.length, 0);
+    const [sinConfM, setSinConfM] = useState(false);
+    const [sinConfOk, setSinConfOk] = useState(false);
+    const confirmarPasados = () => {
+        setPaseos(ps => ps.map(p => {
+            if (!p || p.status !== "programado" || !(p.fecha < T))
+                return p;
+            const dog = mDogs.find(d => d.id === p.dogId);
+            const upd = Object.assign(Object.assign({}, p), { status: "completado" });
+            if (dog) {
+                const snap = buildPaseoSnapshot(upd, dog, routes || [], mDogs, gg, ps, edgeMemory, cfgLugares(cfg), (cfg && cfg.minPorKm) || 15);
+                if (snap)
+                    upd.metrics = snap;
+            }
+            return upd;
+        }));
+        setSinConfM(false);
+        setSinConfOk(false);
+    };
     const ausProx = useMemo(() => { const lim = addDays(T, 7); const out = []; (dogs || []).forEach(d => (d.ausencias || []).forEach(a => { if (a && !a.vac && a.hasta >= T && a.desde <= lim)
         out.push({ d, a }); })); return out.sort((x, y) => x.a.desde.localeCompare(y.a.desde)); }, [dogs, T]);
     const avisosVac = useMemo(() => avisosSalud(mDogs, cfg, T), [mDogs, cfg, T]);
@@ -11832,6 +12025,7 @@ function Agenda({ svc, avisosApp, setWaTpl, partes, setPartes, paseos, setPaseos
         const proximos = [proximoPaseo && { ic: "🐾", t: proximoPaseo.nombre, d: proximoPaseo.fecha, go: () => irAFecha(proximoPaseo.fechaISO, "paseo") }, proximaClase && { ic: "🎓", t: proximaClase.nombre, d: proximaClase.fecha, go: () => irAFecha(proximaClase.fechaISO, "adiestra") }, proximaEstadia && { ic: "🏠", t: proximaEstadia.nombre, d: proximaEstadia.fecha, go: () => irAFecha(proximaEstadia.fechaISO, "estadia") }].filter(Boolean);
         const avisos = [
             ...(avisosApp || []),
+            ...(sinConfN > 0 ? [{ k: "sinconf", ic: "📋", t: sinConfN + (sinConfN === 1 ? " paseo sin confirmar" : " paseos sin confirmar") + " de días anteriores", d: "Ya cuentan para cobrar · tocá para confirmarlos o cancelar los que no se hicieron", col: C.amb, go: () => setSinConfM(true) }] : []),
             ...(finanzasResumen.cantidad > 0 ? [{ k: "deuda", ic: "💰", t: finanzasResumen.cantidad + (finanzasResumen.cantidad === 1 ? " cliente con deuda vencida" : " clientes con deuda vencida"), d: "Total " + $(finanzasResumen.total) + " · tocá para cobrar", col: C.amb, go: () => onGoCobros && onGoCobros() }] : []),
             ...avisosHoy.map(av => {
                 const cl = clients.find(c => c.id === av.dog.cid);
@@ -11924,6 +12118,24 @@ function Agenda({ svc, avisosApp, setWaTpl, partes, setPartes, paseos, setPaseos
     };
     return (React.createElement("div", null,
         arribaNuevo(),
+        sinConfM && React.createElement(Modal, { onClose: () => { setSinConfM(false); setSinConfOk(false); }, title: "📋 Paseos sin confirmar" },
+            React.createElement("div", { id: "pc-sinconf", style: { fontSize: 13, color: C.mut, lineHeight: 1.45, marginBottom: 10 } }, "Son de días que ya pasaron y siguen como \"por hacer\". Para la plata ya cuentan como hechos (Cobros y Stats los cobran). Si alguno no se hizo, entrá a ese día y cancelalo."),
+            sinConf.slice(0, 14).map(d => {
+                const f = new Date(d.fecha + "T12:00:00");
+                const nombres = d.paseos.map(p => (mDogs.find(x => x.id === p.dogId) || {}).name || "").filter(Boolean);
+                return React.createElement("div", { key: d.fecha, className: "pc-sinconf-dia", style: { display: "flex", alignItems: "center", gap: 8, padding: "8px 0", borderTop: `1px solid ${C.bdr}` } },
+                    React.createElement("div", { style: { flex: 1, minWidth: 0 } },
+                        React.createElement("div", { style: { fontSize: 14, fontWeight: 800, color: C.txt } }, ["Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"][f.getDay()] + " " + f.getDate() + "/" + (f.getMonth() + 1) + " · " + d.paseos.length + (d.paseos.length === 1 ? " paseo" : " paseos")),
+                        React.createElement("div", { style: { fontSize: 12, color: C.mut, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, nombres.slice(0, 5).join(", ") + (nombres.length > 5 ? " y " + (nombres.length - 5) + " más" : ""))),
+                    React.createElement("button", { className: "pc-sinconf-ir", onClick: () => { setSel(d.fecha); setSinConfM(false); setSinConfOk(false); }, style: Object.assign(Object.assign({}, BR("secundario", false)), { fontSize: 12, padding: "7px 10px", flexShrink: 0 }) }, "Ver ese día"));
+            }),
+            sinConf.length > 14 && React.createElement("div", { style: { fontSize: 12, color: C.mut, padding: "6px 0" } }, "y " + (sinConf.length - 14) + " días más"),
+            !sinConfOk ? React.createElement("button", { id: "pc-sinconf-todos", onClick: () => setSinConfOk(true), style: Object.assign(Object.assign({}, BR("primario", false)), { width: "100%", marginTop: 12 }) }, "✓ Confirmar los " + sinConfN)
+                : React.createElement("div", { style: { marginTop: 12 } },
+                    React.createElement("div", { style: { fontSize: 13, fontWeight: 700, color: C.amb, marginBottom: 8 } }, "Se marcan como hechos los " + sinConfN + " paseos. ¿Seguro que se hicieron todos?"),
+                    React.createElement("div", { style: { display: "flex", gap: 8 } },
+                        React.createElement("button", { id: "pc-sinconf-no", onClick: () => setSinConfOk(false), style: Object.assign(Object.assign({}, BR("secundario", false)), { flex: 1 }) }, "Volver"),
+                        React.createElement("button", { id: "pc-sinconf-si", onClick: confirmarPasados, style: Object.assign(Object.assign({}, BR("primario", false)), { flex: 1 }) }, "Sí, confirmar")))),
         grupoFiltro && agTab === "paseo" && (() => {
             const gf = gg.find(g => g.id === grupoFiltro);
             return (React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, background: C.grn + "14", border: `1px solid ${C.grn}44`, borderRadius: 10, padding: "7px 12px", marginBottom: 12 } },
@@ -12023,10 +12235,16 @@ function Agenda({ svc, avisosApp, setWaTpl, partes, setPartes, paseos, setPaseos
                                 React.createElement("button", { onClick: () => setConfQuitarMembership({ dogId: dog.id, gid: diagGrupo, dname: dog.name, gname: g.name, pendientes }), style: { fontSize: 12, background: "transparent", border: `1px solid ${C.bdr}`, color: C.mut, fontWeight: 700, padding: "3px 8px", borderRadius: 8 } }, "Quitar")))));
                     }))));
         })(),
-        confQuitarMembership && (React.createElement(Confirm, { title: "Quitar " + confQuitarMembership.dname + " de " + confQuitarMembership.gname + "?", sub: confQuitarMembership.pendientes > 0 ? ("Tiene " + confQuitarMembership.pendientes + " paseo(s) programado(s) en este grupo — se cancelarán también.") : "No tiene paseos programados en este grupo.", danger: true, onOk: () => {
+        confQuitarMembership && (React.createElement(Confirm, { title: "Quitar " + confQuitarMembership.dname + " de " + confQuitarMembership.gname + "?", sub: confQuitarMembership.pendientes > 0 ? ("Tiene " + confQuitarMembership.pendientes + " paseo(s) programado(s) en este grupo: se borran. Lo hecho y cobrado queda.") : "No tiene paseos programados en este grupo.", danger: true, onOk: () => {
                 const { dogId, gid } = confQuitarMembership;
-                setDogs(ds => ds.map(d => d.id === dogId ? Object.assign(Object.assign({}, d), { groups: (d.groups || []).filter(gr => gr.gid !== gid) }) : d));
-                setPaseos(ps => ps.map(p => (p.dogId === dogId && p.gid === gid && p.status === "programado") ? Object.assign(Object.assign({}, p), { status: "cancelado", cancelBy: "tutor" }) : p));
+                // BUG-098: con historia el grupo del perro se cierra (no se borra) y los que vienen sin plata se borran.
+                const hoy = td();
+                const dg = (dogs || []).find(d => d.id === dogId);
+                const nd = dg ? Object.assign(Object.assign({}, dg), { groups: (dg.groups || []).filter(gr => gr.gid === gid).reduce((gs, gr) => quitarDeGrupo(gs, gr.id, paseos, dogId, hoy), dg.groups || []) }) : null;
+                if (nd) {
+                    setDogs(ds => ds.map(d => d.id === dogId ? nd : d));
+                    setPaseos(ps => ps.filter(p => !(p.dogId === dogId && p.gid === gid && p.status === "programado" && p.fecha >= hoy && !((Number(p.pa) || 0) > 0))));
+                }
                 setConfQuitarMembership(null);
             }, onCancel: () => setConfQuitarMembership(null) })),
         editPuntosFijos && (React.createElement("div", { onClick: () => setEditPuntosFijos(null), style: { position: "fixed", inset: 0, overflowY: "auto", background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 160, padding: 20 } },
@@ -14934,7 +15152,7 @@ function ServiciosPerro({ svc, draft, set, gg, setGG, cfg, dog, guarderias, adie
     return (React.createElement("div", { id: "pc-ep-servicios" },
         React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 8 } },
             React.createElement(SeccionPerro, { id: "pc-ep-paseos", ic: "🐾", tit: "Paseos", res: resPas, pad: "6px 6px 8px", abierta: ab === "pas", onToggle: () => tog("pas") },
-                React.createElement(DogGrpsEd, { draft: draft, set: set, gg: gg, setGG: setGG, cfg: cfg, embebido: true, enLinea: true, foco: foco, sinTitulo: true }),
+                React.createElement(DogGrpsEd, { draft: draft, set: set, gg: gg, setGG: setGG, cfg: cfg, embebido: true, enLinea: true, paseos: paseos, foco: foco, sinTitulo: true }),
                 React.createElement("div", { id: "pc-primer-paseo", style: { marginTop: 10, padding: "0 6px" } },
                     React.createElement("label", { style: LBL }, "Empezó con vos el"),
                     React.createElement("input", { type: "date", value: draft.inicioManual || "", onChange: e => { const v = e.target.value; set(x => (Object.assign(Object.assign({}, x), { inicioManual: v }))); }, style: INP }),
@@ -14982,7 +15200,7 @@ function compararClientesAZ(a, b) {
     return na.localeCompare(nb, "es", { sensitivity: "base", numeric: true });
 }
 function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setWaTpl, partes, setPartes, dogs, setDogs, clients, setClients, paseos, setPaseos, gg, setGG, onAdd, onGoCobros, clienteInicial, onClienteInicialUsado, dogEditInicial, onDogEditConsumed, mDogs, routes, edgeMemory, waTpl, cfg, guarderias, adiestramiento, congeladas, onEditSerie, onEditClase, onEditEstadia, onAddEstadia, onAddClase, setCfg, ajustes, ajPeriodo }) {
-    var _b, _e;
+    var _b;
     const [sel, setSel] = useState(null);
     const [modoCli, setModoCli] = useState("lista");
     const [waCli, setWaCli] = useState(null);
@@ -15018,14 +15236,17 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
     const [confArch, setConfArch] = useState(false);
     // Deja el servicio (04/11/2026): {cid,ultimo,elecciones}
     const [bajaM, setBajaM] = useState(null);
-    const confirmarBaja = () => {
+    // bajaM.dogId (BUG-098, 20/11/2026): "Dejó de venir" de UN perro. Mismo cartel y mismo motor, solo con ese
+    // perro; la baja se guarda en el perro (para deshacer) y el cliente NO se archiva.
+    const descCli = cid => ((clients.find(c => c.id === cid) || {}).descuento) || 0;
+    const confirmarBaja = deuda => {
         const b = bajaM;
         if (!b || !b.ultimo)
             return;
-        const plan = bajaPlan(b.cid, dogs.map(migDog), paseos, b.ultimo);
-        const r = aplicarBaja(dogs, paseos, b.cid, b.ultimo, eleccionesBaja(b.elecciones, b.montos), plan, td(), b.plata || {});
+        const plan = bajaPlan(b.cid, dogs.map(migDog), paseos, b.ultimo, b.dogId, descCli(b.cid));
+        const r = aplicarBaja(dogs, paseos, b.cid, b.ultimo, eleccionesBaja(b.elecciones, b.montos, plan), plan, td(), b.plata || {}, b.dogId);
         // Estadías y clases que tenía por delante (se cancelan o se dejan, según eligió en el cartel).
-        const otros = otrosDeBaja(b.cid, dogs.map(migDog), guarderias, adiestramiento, b.ultimo);
+        const otros = otrosDeBaja(b.cid, dogs.map(migDog), guarderias, adiestramiento, b.ultimo, b.dogId);
         const hoy = td();
         const ro = aplicarOtrosBaja(guarderias, adiestramiento, otros, b.otros || {}, hoy);
         r.baja.otrosAntes = ro.antes;
@@ -15033,11 +15254,41 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
             setGuarderias(gs => aplicarOtrosBaja(gs, [], otros.filter(o => o.tipo === "est"), b.otros || {}, hoy).guarderias);
         if (ro.antes.some(x => x.tipo === "cla") && setAdiestramiento)
             setAdiestramiento(as => aplicarOtrosBaja([], as, otros.filter(o => o.tipo === "cla"), b.otros || {}, hoy).adiestramiento);
+        if (b.dogId) {
+            let ps = r.paseos;
+            if (deuda === "perdono") {
+                const pd = perdonarDeudaPerro(ps, b.dogId, b.ultimo, plan);
+                ps = pd.paseos;
+                r.baja.perdon = pd.cambios;
+            }
+            setDogs(r.dogs.map(d => d && d.id === b.dogId ? Object.assign(Object.assign({}, d), { baja: r.baja }) : d));
+            setPaseos(ps);
+            setBajaM(null);
+            if (deuda === "pago" && onGoCobros)
+                onGoCobros(b.cid);
+            return;
+        }
         setDogs(r.dogs);
         setPaseos(r.paseos);
         setClients(cs => cs.map(c => c.id === b.cid ? Object.assign(Object.assign({}, c), { baja: r.baja }) : c));
         setEditC(e => e && e.id === b.cid ? Object.assign(Object.assign({}, e), { baja: r.baja }) : e);
         setBajaM(null);
+    };
+    const deshacerBajaPerro = dogId => {
+        const d = dogs.find(x => x && x.id === dogId);
+        if (!d || !d.baja)
+            return;
+        const bj = d.baja;
+        setDogs(ds => deshacerBaja(ds, bj).map(x => { if (!x || x.id !== dogId)
+            return x; const { baja } = x, rest = __rest(x, ["baja"]); return rest; }));
+        setPaseos(ps => deshacerPerdon(deshacerBajaPaseos(ps, bj), bj.perdon));
+        if ((bj.otrosAntes || []).length) {
+            if (setGuarderias)
+                setGuarderias(gs => deshacerOtrosBaja(gs, [], bj).guarderias);
+            if (setAdiestramiento)
+                setAdiestramiento(as => deshacerOtrosBaja([], as, bj).adiestramiento);
+        }
+        setEditD(null);
     };
     const deshacerLaBaja = cid => {
         const c = clients.find(x => x.id === cid);
@@ -15122,6 +15373,8 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
         const scheduleChanged = !prev || schedKey(prev) !== schedKey(u);
         if (!scheduleChanged && trPaseos)
             setPaseos(trPaseos);
+        if ((u.groups || []).some(g => g && g.hasta))
+            setPaseos(ps => ps.some(p => sobraDespuesDeCerrar(p, u)) ? ps.filter(p => !sobraDespuesDeCerrar(p, u)) : ps);
         if (scheduleChanged) {
             // Los paseos sueltos (p.manual) se conservan: no salen del horario, no hay que regenerarlos
             // (antes cambiar los días de un perro borraba también sus paseos sueltos futuros).
@@ -15753,26 +16006,38 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
                 confArch && React.createElement(Confirm, { title: "¿Archivar a " + ((editC === null || editC === void 0 ? void 0 : editC.name) || "este cliente") + "?", aviso: avisoArchivar(editC && editC.id, dogs, guarderias, adiestramiento, td()) || undefined, sub: "Desaparece de tu lista pero conserva todo su historial. Sus paseos futuros se cancelan. Lo podés reactivar cuando quieras desde 'Archivados'.", onOk: () => { doArchiveCl(editC.id); setConfArch(false); setEditC(null); }, onCancel: () => setConfArch(false) })))),
         bajaM && (() => {
             const cl = clients.find(c => c.id === bajaM.cid);
-            const plan = bajaM.ultimo ? bajaPlan(bajaM.cid, dogs.map(migDog), paseos, bajaM.ultimo) : { grupos: [], cancelar: 0 };
+            const plan = bajaM.ultimo ? bajaPlan(bajaM.cid, dogs.map(migDog), paseos, bajaM.ultimo, bajaM.dogId, descCli(bajaM.cid)) : { grupos: [], cancelar: 0 };
+            const perroB = bajaM.dogId ? dogs.find(d => d && d.id === bajaM.dogId) : null;
             const MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"];
             const per = x => x.men ? MESES[Number(x.ini.slice(5, 7)) - 1] : ("la semana del " + fechaDiaCorto(x.ini).slice(4));
             const elDe = x => bajaM.elecciones[x.grpId] || "nada";
             const montoDe = x => ((bajaM.montos || {})[x.grpId]) || "";
             const setMonto = (x, v) => setBajaM(b => (Object.assign(Object.assign({}, b), { montos: Object.assign(Object.assign({}, (b.montos || {})), { [x.grpId]: v }) })));
             const faltaMonto = plan.grupos.some(x => elDe(x) === "monto" && !(parseInt(montoDe(x), 10) >= 0));
-            const elNum = x => elDe(x) === "monto" ? (parseInt(montoDe(x), 10) || 0) : elDe(x);
+            const elNum = x => elDe(x) === "monto" ? precioDeNeto(x, parseInt(montoDe(x), 10) || 0) : elDe(x);
             const plataDe = x => (bajaM.plata || {})[x.grpId];
-            const aFav = bajaM.ultimo ? aFavorBaja(bajaM.cid, dogs.map(migDog), paseos, bajaM.ultimo) : { total: 0, ids: [] };
+            const aFav = bajaM.ultimo ? aFavorBaja(bajaM.cid, dogs.map(migDog), paseos, bajaM.ultimo, bajaM.dogId) : { total: 0, ids: [] };
             const faltaPlata = plan.grupos.some(x => deMasBaja(x, elNum(x)) > 0 && !plataDe(x)) || (aFav.total > 0 && !(bajaM.plata || {})._aFavor);
-            const otros = bajaM.ultimo ? otrosDeBaja(bajaM.cid, dogs.map(migDog), guarderias, adiestramiento, bajaM.ultimo) : [];
+            const otros = bajaM.ultimo ? otrosDeBaja(bajaM.cid, dogs.map(migDog), guarderias, adiestramiento, bajaM.ultimo, bajaM.dogId) : [];
             const decO = o => (bajaM.otros || {})[o.id] || { accion: "cancelar" };
             const setDecO = (o, k, v) => setBajaM(b => (Object.assign(Object.assign({}, b), { otros: Object.assign(Object.assign({}, (b.otros || {})), { [o.id]: Object.assign(Object.assign({}, ((b.otros || {})[o.id] || { accion: "cancelar" })), { [k]: v }) }) })));
             const faltaOtros = otros.some(o => decO(o).accion !== "dejar" && o.deMas > 0 && !decO(o).plata);
             const okBaja = !!bajaM.ultimo && !faltaMonto && !faltaPlata && !faltaOtros;
+            // Lo que te queda debiendo por ese perro DESPUÉS de la baja (con lo elegido para el período).
+            const deudaX = perroB && okBaja ? (() => {
+                const r = aplicarBaja(dogs, paseos, bajaM.cid, bajaM.ultimo, eleccionesBaja(bajaM.elecciones, bajaM.montos, plan), plan, td(), bajaM.plata || {}, bajaM.dogId);
+                const md = r.dogs.map(migDog), dq = ps => deudaPerroBaja({ clients, mDogs: md, paseos: ps, cid: bajaM.cid, dogId: bajaM.dogId, hoy: td(), congeladas });
+                const tot = dq(r.paseos), resto = tot > 0 ? dq(perdonarDeudaPerro(r.paseos, bajaM.dogId, bajaM.ultimo, plan).paseos) : 0;
+                return { tot, perdona: Math.max(0, tot - resto), resto };
+            })() : { tot: 0, perdona: 0, resto: 0 };
+            const deudaB = deudaX.tot;
+            // Qué hace con lo que debe (BUG-098 2b): solo si hay algo que se pueda perdonar.
+            const faltaDeuda = perroB && deudaX.perdona > 0 && !bajaM.deuda;
+            const okBajaD = okBaja && !faltaDeuda;
             const op = (x, k, l, sub) => { const on = elDe(x) === k; return (React.createElement("button", { key: k, className: "pc-baja-op", "data-k": k, "data-on": on ? "1" : "0", onClick: () => setBajaM(b => (Object.assign(Object.assign({}, b), { elecciones: Object.assign(Object.assign({}, b.elecciones), { [x.grpId]: k }) }))), style: { flex: "1 1 90px", padding: "8px 6px", borderRadius: 10, border: `1.5px solid ${on ? C.grn : C.bdr}`, background: on ? C.grn + "22" : "transparent", color: on ? C.txt : C.mut, cursor: "pointer", textAlign: "center" } },
                 React.createElement("div", { style: { fontSize: 13, fontWeight: 800 } }, l),
                 React.createElement("div", { style: { fontSize: 11, marginTop: 2 } }, sub))); };
-            return (React.createElement(Modal, { onClose: () => setBajaM(null), title: "👋 " + ((cl && cl.name) || "Cliente") + " deja el servicio" },
+            return (React.createElement(Modal, { onClose: () => setBajaM(null), title: perroB ? ("👋 " + (perroB.name || "El perro") + " dejó de venir") : ("👋 " + ((cl && cl.name) || "Cliente") + " deja el servicio") },
                 React.createElement("label", { style: LBL }, "Último día que pasea"),
                 React.createElement("input", { id: "pc-baja-ultimo", type: "date", value: bajaM.ultimo, onChange: e => setBajaM(b => (Object.assign(Object.assign({}, b), { ultimo: e.target.value }))), style: INP }),
                 bajaM.ultimo && React.createElement("div", { style: { fontSize: 13, color: C.mut, margin: "4px 0 12px", lineHeight: 1.4 } }, plan.cancelar > 0 ? ("Se borran " + plan.cancelar + (plan.cancelar === 1 ? " paseo agendado" : " paseos agendados") + " después de ese día.") : "No hay paseos agendados después de ese día."),
@@ -15781,10 +16046,10 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
                     React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 6 } },
                         op(x, "nada", "No se cobra", "$0"),
                         op(x, "monto", "Otro monto", elDe(x) === "monto" && montoDe(x) !== "" ? $(parseInt(montoDe(x), 10) || 0) : "Elegís cuánto"),
-                        op(x, "entero", "Entero", $(x.entero))),
+                        op(x, "entero", "Entero", $(netoBaja(x, x.entero)) + (x.desc > 0 ? (" (con su " + x.desc + "%)") : ""))),
                     elDe(x) === "monto" && React.createElement("div", { className: "pc-baja-monto-box", style: { marginTop: 8 } },
                         React.createElement("input", { className: "pc-baja-monto", type: "number", inputMode: "numeric", value: montoDe(x), placeholder: "¿Cuánto le cobrás?", onChange: e => setMonto(x, e.target.value), style: Object.assign(Object.assign({}, INP), { margin: 0, textAlign: "right", fontWeight: 800 }) }),
-                        React.createElement("button", { className: "pc-baja-sugerido", onClick: () => setMonto(x, String(x.prop)), style: { background: "transparent", border: "none", color: "#60a5fa", fontSize: 12.5, fontWeight: 700, padding: "6px 0 0", cursor: "pointer", textAlign: "left" } }, "Sugerido (proporcional): " + $(x.prop) + " · " + x.dias + " de " + x.diasTot + " días. Tocá para usarlo.")),
+                        React.createElement("button", { className: "pc-baja-sugerido", onClick: () => setMonto(x, String(netoBaja(x, x.prop))), style: { background: "transparent", border: "none", color: "#60a5fa", fontSize: 12.5, fontWeight: 700, padding: "6px 0 0", cursor: "pointer", textAlign: "left" } }, "Sugerido (proporcional" + (x.desc > 0 ? (", con su " + x.desc + "%") : "") + "): " + $(netoBaja(x, x.prop)) + " · " + x.dias + " de " + x.diasTot + " días. Tocá para usarlo.")),
                     deMasBaja(x, elNum(x)) > 0 && (() => {
                         const dm = deMasBaja(x, elNum(x));
                         const opP = (k, t, sub) => { const on = plataDe(x) === k; return (React.createElement("button", { key: k, className: "pc-baja-plata", "data-k": k, "data-on": on ? "1" : "0", onClick: () => setBajaM(b => (Object.assign(Object.assign({}, b), { plata: Object.assign(Object.assign({}, (b.plata || {})), { [x.grpId]: k }) }))), style: { flex: "1 1 120px", padding: "8px 6px", borderRadius: 10, border: `1.5px solid ${on ? C.amb : C.bdr}`, background: on ? C.amb + "22" : "transparent", color: on ? C.txt : C.mut, cursor: "pointer", textAlign: "center" } },
@@ -15794,7 +16059,7 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
                             React.createElement("div", { style: { fontSize: 13, fontWeight: 800, color: C.amb, marginBottom: 6, lineHeight: 1.4 } }, "Ya pagó " + $(x.pagado) + " de " + per(x) + ": quedan " + $(dm) + " de más. ¿Qué hacés con esa plata?"),
                             React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 6 } },
                                 opP("devuelvo", "↩️ Se la devuelvo", "Lo cobrado baja " + $(dm)),
-                                opP("quedo", "💰 Me la quedo", per(x).charAt(0).toUpperCase() + per(x).slice(1) + " vale " + $(Math.min(x.pagado, x.entero)))));
+                                opP("quedo", "💰 Me la quedo", per(x).charAt(0).toUpperCase() + per(x).slice(1) + " vale " + $(Math.min(x.pagado, netoBaja(x, x.entero))))));
                     })()))),
                 aFav.total > 0 && (() => {
                     const opF = (k, t, sub) => { const on = (bajaM.plata || {})._aFavor === k; return (React.createElement("button", { key: k, className: "pc-baja-afavor", "data-k": k, "data-on": on ? "1" : "0", onClick: () => setBajaM(b => (Object.assign(Object.assign({}, b), { plata: Object.assign(Object.assign({}, (b.plata || {})), { _aFavor: k }) }))), style: { flex: "1 1 120px", padding: "8px 6px", borderRadius: 10, border: `1.5px solid ${on ? C.amb : C.bdr}`, background: on ? C.amb + "22" : "transparent", color: on ? C.txt : C.mut, cursor: "pointer", textAlign: "center" } },
@@ -15825,8 +16090,22 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
                                     p2("devuelvo", "↩️ Se la devuelvo"),
                                     p2("quedo", "💰 Me la quedo"))));
                     })),
-                React.createElement("div", { style: { fontSize: 12, color: C.mut, lineHeight: 1.4, marginBottom: 12 } }, "El día siguiente al último se archiva solo (conserva todo su historial). Lo podés deshacer desde Editar cliente."),
-                React.createElement("button", { id: "pc-baja-ok", disabled: !okBaja, onClick: confirmarBaja, style: Object.assign(Object.assign({}, BR("primario", false)), { width: "100%", opacity: okBaja ? 1 : .5 }) }, !bajaM.ultimo ? "Elegí el último día" : (faltaMonto ? "Poné cuánto le cobrás" : (faltaPlata || faltaOtros) ? "Elegí qué hacés con la plata de más" : ("Confirmar: último día " + fechaDiaCorto(bajaM.ultimo))))));
+                perroB && deudaB > 0 && (() => {
+                    const nom = perroB.name || "este perro";
+                    const el = deudaX.perdona > 0 ? bajaM.deuda : null;
+                    const opD = (k, t, sub) => { const on = bajaM.deuda === k; return (React.createElement("button", { key: k, className: "pc-baja-deuda-op", "data-k": k, "data-on": on ? "1" : "0", onClick: () => setBajaM(b => (Object.assign(Object.assign({}, b), { deuda: k }))), style: { flex: "1 1 100px", padding: "8px 6px", borderRadius: 10, border: `1.5px solid ${on ? C.amb : C.bdr}`, background: on ? C.amb + "22" : "transparent", color: on ? C.txt : C.mut, cursor: "pointer", textAlign: "center" } },
+                        React.createElement("div", { style: { fontSize: 13, fontWeight: 800 } }, t),
+                        React.createElement("div", { style: { fontSize: 11, marginTop: 2 } }, sub))); };
+                    return React.createElement("div", { id: "pc-baja-deuda", style: { marginBottom: 12, padding: 10, borderRadius: 10, border: `1px solid ${C.amb}66`, background: C.amb + "12" } },
+                        React.createElement("div", { style: { fontSize: 13, fontWeight: 800, color: C.amb, lineHeight: 1.4, marginBottom: deudaX.perdona > 0 ? 6 : 0 } }, deudaX.perdona > 0 ? ("Por " + nom + " te debe " + $(deudaB) + ". ¿Qué hacés con eso?") : ("Por " + nom + " te queda debiendo " + $(deudaB) + " (lo que elegiste arriba): sigue en Cobros hasta que te lo pague.")),
+                        deudaX.perdona > 0 && React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 6 } },
+                            opD("cobro", "💰 Se la cobro", "Sigue en Cobros"),
+                            opD("pago", "✅ Ya me la pagó", "Te llevo a Cobrar"),
+                            opD("perdono", "🙅 No se la cobro", $(deudaX.perdona) + " a Perdiste")),
+                        el === "perdono" && deudaX.resto > 0 && React.createElement("div", { style: { fontSize: 12, color: C.mut, marginTop: 6, lineHeight: 1.4 } }, "Queda " + $(deudaX.resto) + " del período en curso (lo que elegiste arriba)."));
+                })(),
+                React.createElement("div", { style: { fontSize: 12, color: C.mut, lineHeight: 1.4, marginBottom: 12 } }, perroB ? ("Lo hecho y lo cobrado queda. " + ((cl && cl.name) || "El cliente") + " sigue con sus otros perros. Lo podés deshacer desde Editar " + (perroB.name || "perro") + ".") : "El día siguiente al último se archiva solo (conserva todo su historial). Lo podés deshacer desde Editar cliente."),
+                React.createElement("button", { id: "pc-baja-ok", disabled: !okBajaD, onClick: () => confirmarBaja(perroB && deudaX.perdona > 0 ? bajaM.deuda : null), style: Object.assign(Object.assign({}, BR("primario", false)), { width: "100%", opacity: okBajaD ? 1 : .5 }) }, !bajaM.ultimo ? "Elegí el último día" : (faltaMonto ? "Poné cuánto le cobrás" : (faltaPlata || faltaOtros) ? "Elegí qué hacés con la plata de más" : faltaDeuda ? "Elegí qué hacés con lo que debe" : ("Confirmar: último día " + fechaDiaCorto(bajaM.ultimo))))));
         })(),
         editD && (React.createElement(Modal, { onClose: () => setEditD(null), title: "Editar " + editD.name },
             (() => { const cl = clients.find(x => x.id === editD.cid); return cl ? React.createElement("div", { style: { fontSize: 13, color: C.mut, marginTop: -8, marginBottom: 12 } }, "de " + cl.name) : null; })(),
@@ -15880,6 +16159,20 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
                     React.createElement("button", { id: "pc-guardar-perro", onClick: saveEditDog, disabled: faltaPrecioEdit, style: Object.assign(Object.assign({}, BR("primario", false)), { flex: 2, opacity: faltaPrecioEdit ? .45 : 1, cursor: faltaPrecioEdit ? "not-allowed" : "pointer" }) },
                         "Guardar",
                         cambios && React.createElement("span", { style: { marginLeft: 8, fontSize: 11, fontWeight: 800, background: C.amb + "33", color: "#fbbf24", borderRadius: 6, padding: "1px 6px" } }, "hay cambios"))));
+            })(),
+            (() => {
+                const dg = dogs.find(d => d && d.id === editD.id);
+                const cl = clients.find(c => c.id === editD.cid);
+                if (!dg || !cl || cl.baja)
+                    return null;
+                const unico = !mDogs.some(x => x.cid === dg.cid && x.id !== dg.id && !x.baja);
+                if (dg.baja)
+                    return (React.createElement("div", { id: "pc-baja-perro-info", style: { background: C.amb + "14", border: `1px solid ${C.amb}55`, borderRadius: 12, padding: "10px 12px", marginTop: 16 } },
+                        React.createElement("div", { style: { fontSize: 14, fontWeight: 800, color: C.amb } }, "👋 Dejó de venir: último día " + fechaDiaCorto(dg.baja.ultimo)),
+                        React.createElement("div", { style: { display: "flex", gap: 14, flexWrap: "wrap" } },
+                            onGoCobros && React.createElement("button", { id: "pc-baja-perro-cobrar", onClick: () => { setEditD(null); onGoCobros(cl.id); }, style: { background: "transparent", border: "none", color: C.grn, fontSize: 13, fontWeight: 700, cursor: "pointer", padding: "6px 0 0" } }, "💰 Ver lo que debe"),
+                            React.createElement("button", { id: "pc-baja-perro-deshacer", onClick: () => deshacerBajaPerro(dg.id), style: { background: "transparent", border: "none", color: C.blu, fontSize: 13, fontWeight: 700, cursor: "pointer", padding: "6px 0 0" } }, "Deshacer (sigue viniendo)"))));
+                return (React.createElement("button", { id: "pc-baja-perro-abrir", onClick: () => { setEditD(null); setBajaM(unico ? { cid: cl.id, ultimo: td(), elecciones: {} } : { cid: cl.id, dogId: dg.id, ultimo: td(), elecciones: {} }); }, style: Object.assign(Object.assign({}, BR("secundario", false)), { width: "100%", fontSize: 13, marginTop: 16 }) }, unico ? "👋 Deja el servicio" : "👋 Dejó de venir"));
             })(),
             React.createElement("div", { style: { textAlign: "center", marginTop: 16 } },
                 React.createElement("button", { id: "pc-eliminar-perro", onClick: () => setDelD(editD.id), style: { background: "transparent", border: "none", color: "#f87171", fontSize: 13, fontWeight: 700, textDecoration: "underline", cursor: "pointer", padding: 6 } }, "Eliminar perro")))),
@@ -15954,7 +16247,32 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
             React.createElement("div", { style: { display: "flex", gap: 8, marginTop: 16 } },
                 React.createElement("button", { onClick: () => setAddD(false), style: Object.assign(Object.assign({}, BR("secundario", false)), { flex: 1 }) }, "Cancelar"),
                 React.createElement("button", { onClick: () => doAddDog(sel), disabled: !altaOk.ok, style: Object.assign(Object.assign({}, BR("primario", false)), { flex: 2, opacity: altaOk.ok ? 1 : .45, cursor: altaOk.ok ? "pointer" : "not-allowed" }) }, para.estadia ? "Añadir y cargar estadía" : (para.clases ? "Añadir y cargar clases" : "Añadir"))))),
-        delD && React.createElement(Confirm, { title: "Eliminar " + ((_e = mDogs.find(d => d.id === delD)) === null || _e === void 0 ? void 0 : _e.name) + "?", sub: "Se eliminan sus paseos.", onOk: () => doDelDog(delD), onCancel: () => setDelD(null), danger: true })));
+        delD && (() => {
+            const d = mDogs.find(x => x.id === delD);
+            if (!d)
+                return null;
+            const r = resumenBorrarPerro(paseos, delD, td());
+            const cl = clients.find(c => c.id === d.cid);
+            const unico = !mDogs.some(x => x.cid === d.cid && x.id !== d.id && !x.baja);
+            // Alternativa: si es el único perro, "Deja el servicio" (el cliente); si tiene más, "Dejó de venir" (solo ese
+            // perro, BUG-098): cierra el último período, borra lo que viene y conserva lo hecho, lo cobrado y lo que debe.
+            const alt = () => { if (cl) {
+                setDelD(null);
+                setEditD(null);
+                setBajaM(unico ? { cid: cl.id, ultimo: td(), elecciones: {} } : { cid: cl.id, dogId: d.id, ultimo: td(), elecciones: {} });
+            } };
+            const conAlt = cl && !cl.baja && !d.baja;
+            return (React.createElement("div", { id: "pc-borrar-perro", style: { position: "fixed", inset: 0, overflowY: "auto", background: "rgba(0,0,0,.8)", zIndex: 300, display: "flex", alignItems: "center", justifyContent: "center", padding: 24 } },
+                React.createElement("div", { style: { margin: "auto", background: C.card, borderRadius: 20, padding: 24, maxWidth: 360, width: "100%", border: `1px solid ${C.bdr}` } },
+                    React.createElement("div", { style: { fontWeight: 800, fontSize: 18, color: C.txt, marginBottom: 8 } }, "¿Eliminar a " + d.name + "?"),
+                    r.pierde ? React.createElement(React.Fragment, null,
+                        React.createElement("div", { id: "pc-borrar-perro-pierde", style: { fontSize: 14, color: C.txt, lineHeight: 1.5 } }, "Tiene " + r.hechos + (r.hechos === 1 ? " paseo hecho" : " paseos hechos") + " y " + $(r.cobrado) + " cobrados. Si lo eliminás, se borran todos sus paseos y esa plata sale de Cobros y Stats."),
+                        React.createElement("div", { style: { fontSize: 13.5, color: C.amb, fontWeight: 700, lineHeight: 1.45, marginTop: 10 } }, !conAlt ? "Si te debe algo por " + d.name + ", cobralo antes: eliminarlo también borra lo que te debe." : (unico ? "Si " + (cl.name || "el cliente") + " dejó de venir, usá \"Deja el servicio\": se van los paseos que vienen y lo hecho y cobrado queda." : "Si " + d.name + " dejó de venir, usá \"Dejó de venir\": se van los paseos que vienen y lo hecho, lo cobrado y lo que te debe quedan.")),
+                        conAlt && React.createElement("button", { id: "pc-borrar-perro-alt", onClick: alt, style: Object.assign(Object.assign({}, BR("primario", false)), { width: "100%", marginTop: 14 }) }, unico ? "👋 Deja el servicio" : "👋 Dejó de venir")) : React.createElement("div", { style: { fontSize: 14, color: C.mut, lineHeight: 1.5 } }, "No tiene paseos hechos ni cobros: se borra sin perder nada." + (r.futuros ? " También se borran sus " + r.futuros + " paseos agendados." : "")),
+                    React.createElement("div", { style: { display: "flex", gap: 10, marginTop: 12 } },
+                        React.createElement("button", { id: "pc-borrar-perro-cancelar", onClick: () => setDelD(null), style: Object.assign(Object.assign({}, BR("secundario", false)), { flex: 1 }) }, "Cancelar"),
+                        React.createElement("button", { id: "pc-borrar-perro-ok", onClick: () => doDelDog(delD), style: Object.assign(Object.assign({}, Btn("#7f1d1d", C.txt)), { flex: 1 }) }, r.pierde ? "Eliminar igual" : "Eliminar")))));
+        })()));
 }
 /* └── FIN: screens/Clientes.jsx ─────────────────────────────────────────── */
 /* ┌─────────────────────────────────────────────────────────────────────────┐
@@ -16171,9 +16489,11 @@ function metricasPaseosPorMes(paseos, mDogs) {
 // del cliente. Misma regla que antes tenían Stats > Clientes y Stats > Perros.
 function avisosStats(clStats, dogStats, hoy) {
     const out = [];
+    // Los perros que "Dejaron de venir" (dog.baja, BUG-098) no cuentan: ni en el nombre ni en las veces (21/11/2026).
+    const vivos = cs => (cs.cd || []).filter(d => d && !d.baja);
     const cands = (clStats || []).map(cs => {
         let veces = 0;
-        (cs.cd || []).forEach(dg => (dg.groups || []).forEach(g => { if (enVigenciaGrupo(g, hoy))
+        vivos(cs).forEach(dg => (dg.groups || []).forEach(g => { if (enVigenciaGrupo(g, hoy))
             veces += ((g.schedule || []).length); }));
         const dias = cs.ultPaseo ? Math.floor((Date.parse(hoy) - Date.parse(cs.ultPaseo)) / 86400000) : null;
         if (!(veces > 0) || dias == null)
@@ -16183,10 +16503,10 @@ function avisosStats(clStats, dogStats, hoy) {
     }).filter(c => c && c.atraso > 0 && c.dias >= 7).sort((a, b) => b.atraso - a.atraso);
     if (cands.length) {
         const c = cands[0];
-        out.push({ tipo: "enfrio", cl: c.cs.cl, perros: (c.cs.cd || []).map(x => x.name).join(", "),
-            texto: (c.cs.cd || []).map(x => x.name).join(", ") + " no pasea hace " + c.dias + " días", detalle: "Venía " + c.veces + " veces por semana." });
+        out.push({ tipo: "enfrio", cl: c.cs.cl, perros: vivos(c.cs).map(x => x.name).join(", "),
+            texto: vivos(c.cs).map(x => x.name).join(", ") + " no pasea hace " + c.dias + " días", detalle: "Venía " + c.veces + " veces por semana." });
     }
-    const peor = (dogStats || []).slice().sort((a, b) => (b.cxlCli || 0) - (a.cxlCli || 0))[0];
+    const peor = (dogStats || []).filter(x => !(x && x.dog && x.dog.baja)).slice().sort((a, b) => (b.cxlCli || 0) - (a.cxlCli || 0))[0];
     if (peor && peor.cxlCli > 0)
         out.push({ tipo: "cancela", cl: peor.cl || null, perros: peor.dog.name,
             texto: peor.dog.name + ": " + peor.cxlCli + (peor.cxlCli === 1 ? " cancelación" : " cancelaciones") + " del cliente", detalle: "Capaz vale la pena hablarlo." });
@@ -16238,9 +16558,9 @@ function StatGeneralCard({ cob, perd, rest, antes = 0, cxlCli = 0, desg = null, 
                 React.createElement("div", { id: "pc-st-falta", style: { fontSize: 18, fontWeight: 800, color: "#fcd34d" } }, $(Math.round(rest))),
                 antes > 0.5 && React.createElement("div", { id: "pc-st-antes", style: { fontSize: 12, color: "#fcd34d", opacity: .75 } }, "+ " + $(Math.round(antes)) + " de antes")),
             React.createElement("div", { id: "pc-st-perd-btn", onClick: hayDet ? () => setVerPerd(v => !v) : undefined, style: { cursor: hayDet ? "pointer" : "default" } },
-                React.createElement("div", { style: { fontSize: 12, color: "#fca5a5" } }, "Perdiste por cancelaciones"),
+                React.createElement("div", { style: { fontSize: 12, color: "#fca5a5" } }, "Perdiste"),
                 React.createElement("div", { id: "pc-st-perdida", style: { fontSize: 18, fontWeight: 800, color: "#fca5a5" } }, $(Math.round(perd))),
-                cxlCli > 0 && React.createElement("div", { style: { fontSize: 12, color: "#fca5a5", opacity: .75 } }, cxlCli + " del cliente"),
+                cxlCli > 0 && React.createElement("div", { style: { fontSize: 12, color: "#fca5a5", opacity: .75 } }, cxlCli + (cxlCli === 1 ? " cancelación del cliente" : " cancelaciones del cliente")),
                 deMas > 0.5 && React.createElement("div", { id: "pc-st-demas", style: { fontSize: 12, color: "#86efac", opacity: .85 } }, "Aparte, te pagaron " + $(Math.round(deMas)) + " de más"),
                 hayDet && React.createElement("div", { style: { fontSize: 12, color: "#fca5a5", fontWeight: 700, marginTop: 2, textDecoration: "underline" } }, verPerd ? "Ocultar detalle" : "Ver de dónde sale"))),
         hayDet && verPerd && React.createElement(DetallePerdida, { det: det }),
@@ -17676,7 +17996,7 @@ const TUTO_PASOS = {
     agenda: { titulo: "Agenda", tab: "agenda", nombre: "Conocé la Agenda", desc: "El día a día: paseos, estadías, clases, ventas y la ruta.", pasos: ["Arriba ves el día elegido: con ‹ y › pasás al día anterior o al siguiente, y tocando la fecha se abre el mes entero. Debajo, la semana con puntitos: verde = paseo{cla:, azul = clase}{est:, ámbar = estadía} (gris cuando ya está hecho).", "El cuadro 'Hoy' muestra todo lo del día en orden de hora: {y:tus grupos de paseo;cla=las clases;est=las estadías}{ven: (y las ventas, si hubo)}. Tocá un renglón y abajo se abre su detalle. Si el día está vacío, te muestra lo próximo que tenés. Ahí también, en 'Para tener en cuenta', salen los avisos: cumpleaños, vacunas, ausencias, clientes con deuda vencida y si hace rato que no guardás una copia de tus datos (💾 backup: tocalo para guardarla, o ✕ para que te lo recuerde mañana).", "Debajo de la semana, '＋ Cargar en' (y el día) tiene {est|cla|ven:los servicios que das a la vista: }{!est&!cla&!ven:el botón }{y:🐾 Paseo (un paseo suelto);est=🏠 Estadía;cla=🎓 Clase;ven=🛍️ Venta}. Un toque y cargás {est|cla|ven:ese}{!est&!cla&!ven:un paseo}, en el día que tenés elegido. Al costado, '👥 Grupos ›' abre tus grupos de paseo para crear o cambiar uno.", "El paseo está pensado para usarlo caminando: una línea por perro con la hora en que lo retirás, 💬 para escribirle al dueño y ⋯ para cancelarlo o moverlo (también para ver la dirección en el mapa). Los perros del mismo dueño que salen juntos van en una sola línea; si le pasa algo a uno, ⋯ te pregunta a cuál. Arriba, 'Mapa' abre el recorrido en Google Maps y '📢 Avisar' le escribe a todo el grupo{rut:; debajo, con la barra 'Ida / Vuelta / Informe' cambiás de vista}.", "Para cambiar el orden, los minutos entre perros, la plaza o el lugar de salida, tocá '✏️ Editar recorrido' (abajo de la lista) y cuando terminás '✓ Listo'. Así no se tocan por error mientras caminás.", "'✓ Completar paseo' queda siempre a mano abajo de la pantalla: marca de una vez todos los perros pendientes del grupo."] },
     clientes: { titulo: "Clientes", tab: "clientes", nombre: "Conocé Clientes", desc: "Tus clientes, sus perros y los informes.", pasos: ["La lista muestra cada cliente con sus perros, íconos de lo que usa ahora ({y:🐾 paseo;est=🏠 estadía;cla=🎓 clases}) y lo que te debe. Arriba buscás con 🔍 y filtrás: {est|cla:Todos, }{!est&!cla:Todos o }'💰 Deben' (el globito dice cuántos te deben){est|cla:, o por servicio: {y:🐾 Paseo;est=🏠 Estadía;cla=🎓 Clases}}. Si tenés más de un grupo, abajo aparece 'Grupo' para ver uno solo. El botón de WhatsApp de cada renglón abre el chat.", "'+ Añadir' crea un cliente nuevo: en Chrome podés elegirlo de tus contactos, y el WhatsApp lo escribís como te salga (11 1234-5678, 15…): abajo ves cómo queda y con 'Probar' abrís el chat. Al tocar 'Crear' seguís directo con su perro, y al terminar podés sumar otro perro del mismo cliente con el mismo grupo y precio.", "Tocá un cliente para abrir su ficha. Arriba, botones rápidos: 💬 WhatsApp, 📞 Llamar y 🗺️ Cómo llegar (abre Google Maps con su dirección). Enseguida sus perros: tocá uno para editarlo, o el renglón de su grupo (el del ✏️) para ir directo a ese grupo. Con '+ Perro' le sumás otro. Después lo que te debe, con '💰 Cobrar'. Abajo, plegados y con la misma forma: Mensajes, Acuerdo de servicio, Enviar informe, Cancelaciones e Historial de aumentos. El descuento permanente (%) se carga con '✏️ Editar' del cliente y se aplica en Cobros.", "Tocá un perro para editarlo, o tocá directo el renglón de su grupo (el del ✏️) y se abre ya ahí, con el precio listo para cambiar. Cada parte es un renglón con su resumen que se abre tocándolo: Paseos (días, precio y cómo te paga; en ⋯ lo cambiás de grupo o lo sacás){est:, Estadías}{cla:, Clases}, Comida y remedios, Ausencias largas, Incidentes (si hubo) y Datos del perro (primer paseo, raza, veterinario, vacunas). En Datos del perro, con '+ Agregar dato' sumás tus propios datos (ej. 'Pretal o collar'): aparecen en todos los perros y, si tildás pedírselo al cliente, van en los mensajes de 'Solicitar datos' cuando están vacíos. 'Eliminar perro' está al final.", "En la ficha, 'Enviar informe' arma un resumen {rut:(día, semana o mes) para mandar por WhatsApp, financiero o de ruta}{!rut:(semana o mes) para mandar por WhatsApp}. {est:Si tiene una estadía, 'Confirmación de estadía' arma el mensaje con fechas, horarios y qué llevar. }Al final podés archivar al cliente: sale de la lista pero conserva su historial.", "Si un cliente deja de venir, en '✏️ Editar' del cliente tocá '👋 Deja el servicio': elegís el último día que pasea y cómo le cobrás ese mes o semana ('No se cobra', 'Otro monto' con el proporcional como sugerencia, o 'Entero'). Si ya te había pagado de más{est|cla:, o tiene {o:est=estadías;cla=clases} por delante}, te pregunta qué hacés con eso ('Se la devuelvo' o 'Me la quedo'). Al día siguiente del último se archiva solo, y se puede deshacer desde Editar cliente.", "En '💬 WhatsApp' tocás un cliente y ves todos los mensajes que le tocan, o en 'Por mensaje' elegís uno y a quién mandárselo. Si un mensaje no lo usás, tocá 📦: lo archivás solo para ese cliente o para todos. Queda en '📦 Archivados' y con 'Volver a usar' vuelve. En ☰ > Mensajes de WhatsApp apagás 'Lo uso' en los que nunca mandes, le cambiás el título a cualquiera y con '+ Mensaje nuevo' creás los tuyos. En los pedidos de datos, 'Qué le preguntás' te deja elegir qué preguntar; con '+ Agregar pregunta' sumás las tuyas, con un título corto para la lista y el texto que va en el mensaje (se editan con ✏️)."] },
     cobros: { titulo: "Cobros", tab: "cobros", nombre: "Conocé Cobros", desc: "Quién te debe y cómo registrar los pagos.", pasos: ["Cobros muestra quién te debe. Arriba elegís el período (Semana o Mes) y ves dos números: lo cobrado{est|cla|ven: ({y:paseos;est=estadías;cla=clases;ven=ventas de artículos})} y 'Falta cobrar', con '+ $X de antes' si alguien arrastra deuda de períodos anteriores. Son los mismos números del encabezado y de Stats. Tocando lo cobrado ves '💰 Lo que entró: quién pagó y cuánto'.", "Abajo está la lista 'Te deben': cada cliente con lo de este período y lo de antes. {est|cla:Con los filtros Todos / 🐾{est: / 🏠}{cla: / 🎓} ves solo {o:paseos;est=estadías;cla=clases}. }Los que no deben nada quedan plegados en '✓ Al día'.", "Tocá un cliente para abrir su ficha de cobro: el recuadro 'Te debe' separa lo de esta semana (o mes) y lo de antes, y con '📲 Mandarle lo que debe por WhatsApp' le mandás el detalle.", "'Cobrar' registra el pago. Si además arrastra deuda de antes, te pregunta '¿Cuánto te pagó?': todo, solo esta semana, solo lo de antes u otro monto (se aplica primero a lo más viejo). Con 'Pago parcial' cobrás solo una parte. El total no se edita acá: si necesitás corregirlo, en la misma ficha tenés '＋ Ajuste': elegís {est|cla:a qué se lo aplicás ({o:los paseos;est=una estadía;cla=unas clases}), }− (descuento, va a Perdiste) o + (recargo), el monto, y tocás 'Aplicar', que pide confirmación. Queda en 'Ajustes cargados' con ✕ para quitarlo; si cargás otro, se suma.", "'Adelanto de paseos' es para cuando el cliente te paga por adelantado, a cuenta de paseos que todavía no hizo: queda como saldo a favor. Los abonos mensuales{cla: y las clases} que te pagan por adelantado cuentan como cobrados en la semana (y el mes) en que te pagan.", "{est|cla:Las {y:est=estadías;cla=clases} también se cobran acá, aparte de los paseos (o directo desde su ficha en la Agenda, con 'Cobrar'): con el filtro {o:est=🏠;cla=🎓} ves solo esas. Cada una tiene su propio tutorial con el detalle.}"] },
-    stats: { titulo: "Stats", tab: "stats", nombre: "Conocé Stats", desc: "Tu negocio en números.", pasos: ["Stats es tu negocio en números. Tiene {rut:4 solapas: Resumen, Plata, Clientes y Rutas}{!rut:3 solapas: Resumen, Plata y Clientes}. En Resumen{rut: y Rutas} elegís el período (Semana o Mes) y lo movés con las flechas.", "Arriba del Resumen ves 'Ya cobraste', 'Falta cobrar' (con lo 'de antes' si alguien arrastra deuda) y 'Perdiste por cancelaciones': son los mismos números que Cobros. Tocá la pérdida para ver de dónde sale: cancelados, descuentos, ausencias, semanas sin paseos. En el Mes, abajo, la comparación con el mes pasado al mismo día y lo cobrado en los últimos 6 meses.", "{est|cla|ven:'¿De dónde salió la plata?' reparte lo cobrado entre {y:paseos;est=estadías;cla=clases;ven=ventas}: tocá uno para ver su detalle abajo.}{!est&!cla&!ven:'¿De dónde salió la plata?' muestra lo cobrado por paseos: tocalo para ver el detalle abajo.} En paseos, 'Semana a semana' lista las semanas del mes: tocá una para ver su detalle por perro, y con la flecha ← volvés al mes. '👀 Para mirar' te avisa si un cliente dejó de venir o cancela seguido, con un botón para escribirle.", "En Plata ves cuánto cobrás por mes en promedio, {est|cla|ven:cómo se reparte, los promedios de cada servicio, } tus récords y los gráficos de los últimos meses. En Clientes tenés el ranking de clientes y, con el botón Perros, el de asistencia.", "{rut:En Rutas ves los km y el tiempo en la calle, y una línea por perro: tocála para ver el detalle.}"] },
+    stats: { titulo: "Stats", tab: "stats", nombre: "Conocé Stats", desc: "Tu negocio en números.", pasos: ["Stats es tu negocio en números. Tiene {rut:4 solapas: Resumen, Plata, Clientes y Rutas}{!rut:3 solapas: Resumen, Plata y Clientes}. En Resumen{rut: y Rutas} elegís el período (Semana o Mes) y lo movés con las flechas.", "Arriba del Resumen ves 'Ya cobraste', 'Falta cobrar' (con lo 'de antes' si alguien arrastra deuda) y 'Perdiste' (cancelaciones, descuentos y lo que decidiste no cobrar): son los mismos números que Cobros. Tocá la pérdida para ver de dónde sale: cancelados, descuentos, ausencias, semanas sin paseos. En el Mes, abajo, la comparación con el mes pasado al mismo día y lo cobrado en los últimos 6 meses.", "{est|cla|ven:'¿De dónde salió la plata?' reparte lo cobrado entre {y:paseos;est=estadías;cla=clases;ven=ventas}: tocá uno para ver su detalle abajo.}{!est&!cla&!ven:'¿De dónde salió la plata?' muestra lo cobrado por paseos: tocalo para ver el detalle abajo.} En paseos, 'Semana a semana' lista las semanas del mes: tocá una para ver su detalle por perro, y con la flecha ← volvés al mes. '👀 Para mirar' te avisa si un cliente dejó de venir o cancela seguido, con un botón para escribirle.", "En Plata ves cuánto cobrás por mes en promedio, {est|cla|ven:cómo se reparte, los promedios de cada servicio, } tus récords y los gráficos de los últimos meses. En Clientes tenés el ranking de clientes y, con el botón Perros, el de asistencia.", "{rut:En Rutas ves los km y el tiempo en la calle, y una línea por perro: tocála para ver el detalle.}"] },
     estadias: { titulo: "Estadías", tab: "agenda", nombre: "Conocé Estadías", desc: "Guardería: cargar, recurrente, confirmar y cobrar.", pasos: ["Una estadía es guardería: el perro se queda con vos un día (jornada) o varias noches (pensionado). Desde la Agenda, en la solapa 'Estadías', tocás el botón 'Estadía' (arriba a la derecha), elegís 'Una vez', el perro, cuándo Llega y cuándo Se va, el horario y el precio (por jornada si es un día, por noche si son varias). Si ya vino antes, el horario y el precio aparecen como la última vez. Abajo contestás '¿Ya te pagó?' (Sí, todo / Una seña / Todavía no): así el pago queda anotado sin ir a Cobros. Al elegir el perro también podés cargar su comida y medicación: aparecen en la Agenda cada día para tildar lo que ya le diste.", "Si el perro viene fijo (ej. lunes y miércoles), no la cargues una por una: en la solapa 'Estadías' tocá 'Estadía', elegí 'Todas las semanas', marcá los días, el 'Desde (día de inicio)' —puede ser hoy o un día futuro—, el horario, el precio y hasta cuándo (Solo la próxima / N semanas / Sin fin, que se cuentan desde ese inicio). Se genera sola y se va extendiendo. Para cambiarla después, tocá una jornada y 'Editar toda la serie'.", "En la Agenda cada estadía aparece en su día como Programado, Completado o Cancelado. Cuando el perro llega, tocás '✓ Confirmar que vino' (cuenta para el cobro). Con ⋯ podés mover / editar las fechas o cancelar; en una recurrente, al borrar elegís 'Solo esta' o 'Esta y las siguientes'. No deja cargar dos estadías del mismo perro que se pisan. Si la estadía ya tiene plata, al editarla te dice cuánto pagó y cuánto queda; si la acortás y pagó de más, te pregunta si se la devolvés o te la quedás, y si después se alarga, si usás esa plata a favor. Si borrás una que ya tiene plata, también te pregunta qué hacés con esa plata.", "En la ficha del cliente, el bloque 'Confirmación de estadía' arma un mensaje de WhatsApp con fechas, horarios, qué llevar y la plata. Si es recurrente, sale un solo mensaje que le dice los días de la semana y el horario.", "Las estadías se cobran aparte de los paseos. En Cobros, 'Falta cobrar' suma lo que falta de las estadías del período; con el filtro 🏠 ves solo esas, y tocando una registrás el pago (seña o saldo).", "En la ficha de cada estadía ves la barra 'Llegó / día X de Y / se va', el aviso del día que llega o se va, la comida y los remedios para tildar, y la plata: 'Pagó todo' o cuánto falta, con 'Cobrar' ahí mismo (es la misma cuenta que Cobros)."] },
     adiestramiento: { titulo: "Adiestramiento", tab: "agenda", nombre: "Conocé Adiestramiento", desc: "Clases de adiestramiento: cargar, dictar, progreso y cobrar.", pasos: ["El adiestramiento son clases, aparte de los paseos{est: y la guardería}. Desde la Agenda, debajo de la semana, tocás 🎓 'Clase' y se abre '🎓 Cargar clases'. Elegís el perro (si el cliente no está, tocás '¿No está el cliente? Cargalo acá'); si ya tuvo clases, el día, el horario y el precio aparecen como la última vez. Elegís 'Una clase', o 'Varias, todas las semanas': ahí marcás qué días y 'Cuántas clases' (4, 8, 12 u Otra). Ponés desde cuándo, a qué hora Empieza (Termina se completa sola, una hora después) y el 'Precio por clase'. Abajo contestás '¿Ya te pagó?' y ves el resumen con la última clase. Las fechas de las clases se generan solas.", "En la Agenda, la solapa 'Clases' te muestra las clases del día. Cada una dice 'Clase X de N', el horario, si está dictada y si está paga. En el calendario, los puntitos azules marcan los días con clase.", "Cuando das una clase, en la de hoy o pasada tocás '✓ Marcar como dictada' y en el campo '¿Qué trabajaron hoy?' escribís qué se trabajó (se guarda en el Progreso). Para ver el avance de toda la serie junto, tocá ⋯ y '📈 Progreso': es la bitácora con cada clase, su estado y su nota, y desde ahí completás cualquiera sin ir día por día. Al marcar la última clase del curso, la app te pregunta si querés hacer un seguimiento más adelante (en una semana, en 14 días o en un mes): ese día te aparece '🔔 Seguimiento' en 'Para tener en cuenta' de la Agenda, y ahí elegís si lo repetís.", "Si una clase cambia de día u horario o no se da, en una clase de hoy o futura tocás ⋯ y 'Cambiar día u horario'. Te pregunta si es solo esa clase o esa y las que siguen. 'Solo esta clase' la corre a otro día u horario (no cambia el total). 'Esta y las que siguen' abre la serie: las anteriores quedan como estaban. 'Omitir' te da dos opciones: 'Reprogramar' (se corre al próximo día y mantenés la misma cantidad de clases) o 'Quitar' (una clase menos, baja el total).", "Las clases se cobran en Cobros, aparte de {y:los paseos;est=las estadías}. Con el filtro 🎓 ves las series con saldo; tocás una, en 'Clases a cobrar' elegís cuántas cobrar (una, todas, o las que quieras con los botones − y +) y tocás 'Cobrar'. Lo cobrado cuenta por caja, y 'Falta cobrar' suma lo que todavía falta.", "En la ficha de la clase, abajo, ves cuánto vale esa clase y si ya está paga, y el paquete entero. Con 'Cobrar' registrás el pago ahí mismo (es la misma cuenta que Cobros)."] },
     ventas: { titulo: "Ventas", tab: "agenda", nombre: "Conocé Ventas", desc: "Vendé artículos (collares, snacks...) y que sume a tus ingresos.", pasos: ["Ventas es para lo que vendés aparte de los servicios: collares, correas, pecheras, snacks. En la Agenda, debajo de la semana, tocá 🛍️ 'Venta'. La venta queda en el día que tengas elegido (lo podés cambiar en 'Fecha').", "Primero cargá tus artículos: abajo, en 'Artículos', escribís el nombre y el precio y tocás 'Agregar'. Ahí mismo le cambiás el nombre o el precio a cualquiera. Para sacar uno, 'Borrar' y después '¿Seguro?'. Las ventas ya hechas no cambian: cada una guarda el nombre y el precio de ese momento.", "Para vender, tocá el + de lo que lleva la persona; con + y − ajustás la cantidad. Si tenés muchos artículos, arriba ves los más vendidos, 'Ver todos' y el buscador 🔍. Lo elegido aparece en 'Lleva', donde le podés cambiar el precio de esa vez. Todo lo que lleva una persona queda como una sola venta: tocá 'Registrar venta' y listo.", "Debajo aparecen las 'Ventas de este día', con la × para borrar una si te equivocaste. En el cuadro 'Hoy' de la Agenda aparece un renglón 'Ventas' cuando vendiste algo ese día.", "Lo que vendés suma solo a tus ingresos: al 'Cobrado este mes' de arriba, a lo cobrado en Cobros y a Stats. En Stats, en '¿De dónde salió la plata?' tocás 🛍️ Ventas para ver el detalle, y en la solapa Plata tenés los promedios, el récord y lo que más vendés."] },
@@ -19100,6 +19420,41 @@ function App() {
         }
         catch (e) { } };
     }, [!!(cfg && cfg.contadorOff)]);
+    // Primeros pasos (20/11/2026): cuando llega a un paso nuevo, lo avisa una vez (ver pasosAlcanzados).
+    const pasosHechos = pasosAlcanzados({ onboardingDone, clients, dogs, paseos, guarderias, adiestramiento }).join(",");
+    const pasosEnviando = useRef(false);
+    useEffect(() => {
+        const alc = pasosHechos ? pasosHechos.split(",") : [];
+        const r = pasosPorMandar(storage.load("pc_pasos", null), alc);
+        if (!storage.load("pc_pasos", null))
+            storage.save("pc_pasos", r.st);
+        if (!r.mandar.length || pasosEnviando.current || (cfg && cfg.contadorOff))
+            return;
+        let prot = "", onl = true;
+        try {
+            prot = window.location.protocol;
+            onl = navigator.onLine;
+        }
+        catch (e) { }
+        if (prot !== "https:" || onl === false || typeof fetch !== "function")
+            return;
+        let inst = storage.load("pc_inst", null);
+        if (!inst) {
+            inst = nuevoInst();
+            storage.save("pc_inst", inst);
+        }
+        pasosEnviando.current = true;
+        (async () => {
+            for (const x of r.mandar) {
+                const ok = await enviarPaso(fetch, { url: SUPA_URL, key: SUPA_KEY, inst, paso: x.paso, ya: x.ya, ver: APP_VER });
+                if (!ok)
+                    break;
+                const cur = storage.load("pc_pasos", null) || r.st;
+                storage.save("pc_pasos", Object.assign(Object.assign({}, cur), { env: [...(cur.env || []).filter(k => k !== x.paso), x.paso] }));
+            }
+            pasosEnviando.current = false;
+        })();
+    }, [pasosHechos, !!(cfg && cfg.contadorOff)]);
     // Primeros pasos: lista, acciones y el "Listo" cuando el paso que te guía se tilda solo.
     const copia = ultimaCopia(ultimoBackup, nube, nubeEsLink);
     const pasosPP = primerosPasos({ svc, cobroInicial: cfg && cfg.cobroInicial, dogs, paseos, guarderias, adiestramiento, ultimoBackup: copia.fecha, respondio: !!(cfg && cfg.servicios) });
@@ -19443,7 +19798,7 @@ function App() {
                             React.createElement("div", { style: { fontSize: 12, color: C.mut, marginTop: 6, textAlign: "center" } }, (TEXT_SCALES.find(x => x[0] === normScale(cfg.textScale)) || TEXT_SCALES[0])[1])))),
                     G("privacidad", "🔒", "Privacidad", cfg.contadorOff ? "No avisa que se usa" : "Avisa de forma anónima que se usa", React.createElement(React.Fragment, null,
                         React.createElement("div", { style: { padding: "10px 0" } },
-                            TIT("Contar que se usa la app", "Una vez por día manda solo un número al azar de este celular, para saber cuánta gente usa PaseoCan. Sin nombre, mail, clientes ni plata."),
+                            TIT("Contar que se usa la app", "Una vez por día manda solo un número al azar de este celular, para saber cuánta gente usa PaseoCan, y avisa una sola vez cuando llegás a un primer paso (primer cliente, primer perro, primer paseo, primer cobro). Sin nombre, mail, clientes ni plata."),
                             React.createElement("div", { id: "pc-cfg-contador", style: { display: "flex", gap: 6, marginTop: 8 } },
                                 React.createElement("button", { "data-k": "si", onClick: () => setCfg(c => (Object.assign(Object.assign({}, c), { contadorOff: false }))), style: SEG(!cfg.contadorOff) }, "Sí"),
                                 React.createElement("button", { "data-k": "no", onClick: () => setCfg(c => (Object.assign(Object.assign({}, c), { contadorOff: true }))), style: SEG(!!cfg.contadorOff) }, "No"))))),
