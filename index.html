@@ -2375,7 +2375,7 @@ function nombreDato(k) { return NOMBRE_DATO[k] || k; }
 // HTML: la base solo deja hacer lo que permiten sus reglas (RLS). NUNCA poner acá la secret/service_role.
 const SUPA_URL = "https://zwuakvfsgesdeiioimcj.supabase.co";
 const SUPA_KEY = "sb_publishable_aIkR9AH_aUigZVcm_eNlKQ_1eMtomWx";
-const APP_VER = "2026-11-21g";
+const APP_VER = "2026-11-21h";
 // Contador anónimo (Matías: "¿vamos a saber cuánta gente la está usando?"): una vez por día que se abre
 // la app, manda un número al azar de este celular + la versión (desde el 21/11 también % de espacio, rango de
 // paseos y si usa la nube: ver usoParaContar). Sin nombre, mail ni datos de clientes o plata. La
@@ -2398,14 +2398,28 @@ function nuevoInst() {
 // o acelerar "lo de antes", el contador suma 3 números: % de espacio usado, cuántos paseos EN RANGOS (no el número
 // exacto) y si usa la nube (la nube guarda una copia más: ocupa el doble). Nada de nombres, clientes ni plata.
 function rangoPaseos(n) { n = Number(n) || 0; return n <= 0 ? "0" : n < 100 ? "1-99" : n < 1000 ? "100-999" : n < 3000 ? "1000-2999" : n < 5000 ? "3000-4999" : "5000+"; }
-function usoParaContar({ usado, limite, paseos, nube }) { return { esp: espacioPct(usado, limite), pas: rangoPaseos(paseos), nube: !!nube }; }
+// idb (21/11, IndexedDB etapa 2): cómo dio la comparación del espejo al abrir (ok / nuevo / dif:N / sin / falla).
+function usoParaContar({ usado, limite, paseos, nube, idb }) { const u = { esp: espacioPct(usado, limite), pas: rangoPaseos(paseos), nube: !!nube }; if (idb)
+    u.idb = String(idb).slice(0, 12); return u; }
 async function contarApertura(fetchFn, { url, key, inst, ver, uso }) {
     const mandar = async (body) => fetchFn(url + "/rest/v1/aperturas", { method: "POST", headers: { apikey: key, "Content-Type": "application/json", Prefer: "return=minimal" }, body: JSON.stringify(body) });
+    // 400 = a la tabla le faltan columnas: se prueba con menos (sin idb; después solo inst y versión). Nunca deja de contar.
+    const intentos = [];
+    if (uso) {
+        intentos.push(Object.assign({ inst, ver }, uso));
+        if ("idb" in uso) {
+            const { idb } = uso, sinIdb = __rest(uso, ["idb"]);
+            intentos.push(Object.assign({ inst, ver }, sinIdb));
+        }
+    }
+    intentos.push({ inst, ver });
     try {
-        let r = await mandar(uso ? Object.assign({ inst, ver }, uso) : { inst, ver });
-        // 400 = la tabla todavía no tiene las columnas nuevas (esp, pas, nube): se cuenta igual, como antes.
-        if (uso && r && r.status === 400)
-            r = await mandar({ inst, ver });
+        let r;
+        for (const b of intentos) {
+            r = await mandar(b);
+            if (!(r && r.status === 400))
+                break;
+        }
         return !!r && (r.ok || r.status === 409);
     } // 409 = ya contado hoy (otro día del servidor)
     catch (e) {
@@ -3363,6 +3377,138 @@ async function guardarBaseSync({ db, enIdb, base, guardarLS, borrarLS }) {
         borrarLS();
     return false;
 }
+// ═══ IndexedDB — etapa 2: ESPEJO (21/11/2026) ═══
+// Todo lo que se guarda en localStorage se copia también a IndexedDB (claves "ls:<clave>", el MISMO texto). La app
+// sigue leyendo SOLO de localStorage: el espejo no se usa para trabajar, así que no puede romper nada. Sirve para:
+//  · ver en celulares reales si IndexedDB guarda bien (al abrir compara clave por clave y lo manda el contador);
+//  · la etapa 3, cuando se lea de IndexedDB, ya tener los datos ahí.
+// Escribe de a tandas (1 s) para no frenar la app; al irse de la app escribe al toque. Todo con tiempo límite y sin
+// tirar errores; si IndexedDB no anda, el espejo se apaga solo ("sin").
+const ESPEJO_PREF = "ls:";
+function idbLote(db, ops, tm) {
+    if (!db || !ops.length)
+        return Promise.resolve({ ok: !!db });
+    return idbPedido(db, "readwrite", st => { let rq; ops.forEach(([k, v]) => { rq = v === null ? st.delete(ESPEJO_PREF + k) : st.put(v, ESPEJO_PREF + k); }); return rq; }, 8000, tm);
+}
+function idbLeerEspejo(db, tm) {
+    if (!db)
+        return Promise.resolve({ ok: false });
+    const T = tm || IDB_TM;
+    return new Promise(res => {
+        let listo = false;
+        const fin = v => { if (!listo) {
+            listo = true;
+            res(v);
+        } };
+        const t = T.set(() => fin({ ok: false }), 8000);
+        try {
+            const tx = db.transaction(IDB_ALMACEN, "readonly");
+            const st = tx.objectStore(IDB_ALMACEN);
+            const out = {};
+            const rk = st.getAllKeys();
+            rk.onsuccess = () => { (rk.result || []).forEach(k => { if (typeof k === "string" && k.indexOf(ESPEJO_PREF) === 0) {
+                const g = st.get(k);
+                g.onsuccess = () => { out[k.slice(ESPEJO_PREF.length)] = g.result; };
+            } }); };
+            tx.oncomplete = () => { T.clear(t); fin({ ok: true, val: out }); };
+            tx.onerror = () => { T.clear(t); fin({ ok: false }); };
+            tx.onabort = () => { T.clear(t); fin({ ok: false }); };
+        }
+        catch (e) {
+            T.clear(t);
+            fin({ ok: false });
+        }
+    });
+}
+// Compara localStorage con el espejo: "nuevo" (espejo vacío: primera vez), "ok", o "dif" con las claves.
+// tocadas: claves que la app ya guardó en esta sesión (todavía en la cola): que difieran es lo esperado, no un desvío.
+function compararEspejo(ls, esp, tocadas) {
+    const a = ls || {}, b = esp || {};
+    const kb = Object.keys(b);
+    const t = new Set(tocadas || []);
+    if (!kb.length)
+        return { estado: "nuevo", distintas: [], faltan: [], sobran: [] };
+    const distintas = [], faltan = [], sobran = [];
+    Object.keys(a).forEach(k => { if (t.has(k))
+        return; if (!(k in b))
+        faltan.push(k);
+    else if (b[k] !== a[k])
+        distintas.push(k); });
+    kb.forEach(k => { if (!t.has(k) && !(k in a))
+        sobran.push(k); });
+    const n = distintas.length + faltan.length + sobran.length;
+    return { estado: n ? "dif" : "ok", distintas, faltan, sobran };
+}
+// Lo que viaja en el contador (corto y sin datos): ok / nuevo / dif:N / sin / falla.
+function resumenEspejo(r) { if (!r)
+    return "pend"; if (r.estado === "dif")
+    return "dif:" + (r.distintas.length + r.faltan.length + r.sobran.length); return r.estado; }
+function crearEspejo() {
+    const E = { db: null, listo: false, apagado: false, cola: new Map(), timer: null, res: null, promesa: null, tm: null, escribiendo: Promise.resolve() };
+    E.anotar = (k, txt) => { if (E.apagado || !k || k === IDB_BASE)
+        return; E.cola.set(k, txt); if (E.listo && !E.timer)
+        E.timer = (E.tm || IDB_TM).set(() => { E.timer = null; E.vaciar(); }, 1000); };
+    E.vaciar = () => {
+        if (!E.listo || E.apagado || !E.cola.size)
+            return E.escribiendo;
+        if (E.timer) {
+            (E.tm || IDB_TM).clear(E.timer);
+            E.timer = null;
+        }
+        const ops = [...E.cola];
+        E.cola.clear();
+        E.escribiendo = E.escribiendo.then(() => idbLote(E.db, ops, E.tm)).then(r => { if (!r.ok) {
+            E.res = { estado: "falla" };
+        } }).catch(() => { });
+        return E.escribiendo;
+    };
+    // leerLS: () => {clave: texto} de todo localStorage. Compara, rellena el espejo con lo de ahora y queda escuchando.
+    E.iniciar = (fac, leerLS, tm) => {
+        if (E.promesa)
+            return E.promesa;
+        E.tm = tm || null;
+        E.promesa = (async () => {
+            const db = await idbAbrir(fac, 4000, tm);
+            if (!db) {
+                E.apagado = true;
+                E.cola.clear();
+                E.res = { estado: "sin" };
+                return E.res;
+            }
+            E.db = db;
+            let ls = {};
+            try {
+                ls = leerLS() || {};
+            }
+            catch (e) { }
+            delete ls[IDB_BASE];
+            const r = await idbLeerEspejo(db, tm);
+            if (!r.ok) {
+                E.apagado = true;
+                E.cola.clear();
+                E.res = { estado: "falla" };
+                return E.res;
+            }
+            const cmp = compararEspejo(ls, r.val, [...E.cola.keys()]);
+            const ops = Object.keys(ls).map(k => [k, ls[k]]).concat(Object.keys(r.val).filter(k => !(k in ls)).map(k => [k, null]));
+            const w = await idbLote(db, ops, tm);
+            if (!w.ok) {
+                E.apagado = true;
+                E.cola.clear();
+                E.res = { estado: "falla" };
+                return E.res;
+            }
+            E.res = cmp;
+            E.listo = true;
+            await E.vaciar(); // lo guardado mientras arrancaba va después: queda lo más nuevo
+            return E.res;
+        })().catch(() => { E.apagado = true; E.res = { estado: "falla" }; return E.res; });
+        return E.promesa;
+    };
+    E.resumen = () => resumenEspejo(E.res);
+    return E;
+}
+const ESPEJO = crearEspejo();
 // ¿Los mismos datos? Sin mirar la hora del backup, la versión ni las marcas de la nube.
 function syncMismosDatos(a, b) {
     const A = a || {}, B = b || {};
@@ -3530,6 +3676,7 @@ const storage = {
             // pisaba. Ahora se guarda una copia tal cual (pc_danado_<clave>) y se avisa en pantalla.
             try {
                 localStorage.setItem("pc_danado_" + key, raw);
+                ESPEJO.anotar("pc_danado_" + key, raw);
             }
             catch (_g) { }
             if (PC_SALUD.danados.indexOf(key) < 0)
@@ -3543,7 +3690,9 @@ const storage = {
     // y el ÚLTIMO valor que no se pudo guardar, para el cartel rojo y el botón "Reintentar".
     save(key, value) {
         try {
-            localStorage.setItem(key, JSON.stringify(value));
+            const txt = JSON.stringify(value);
+            localStorage.setItem(key, txt);
+            ESPEJO.anotar(key, txt); // IndexedDB etapa 2: copia (no se lee)
             if (PC_SALUD.fallos[key] !== undefined) {
                 delete PC_SALUD.fallos[key];
                 delete PC_SALUD.pendiente[key];
@@ -3561,7 +3710,9 @@ const storage = {
     // Para copias que se pueden rehacer (la base de la sincronización): si no entra, no se avisa en rojo.
     guardarSinAviso(key, value) {
         try {
-            localStorage.setItem(key, JSON.stringify(value));
+            const txt = JSON.stringify(value);
+            localStorage.setItem(key, txt);
+            ESPEJO.anotar(key, txt);
             return true;
         }
         catch (e) {
@@ -3571,6 +3722,7 @@ const storage = {
     remove(key) {
         try {
             localStorage.removeItem(key);
+            ESPEJO.anotar(key, null);
         }
         catch (_b) { }
     },
@@ -3586,6 +3738,16 @@ const storage = {
         }
         catch (_b) { }
         return out;
+    },
+    // Todo lo guardado tal cual (texto), para el espejo de IndexedDB (etapa 2).
+    crudos() {
+        const o = {};
+        try {
+            this.todas().forEach(k => { const v = localStorage.getItem(k); if (v != null)
+                o[k] = v; });
+        }
+        catch (_b) { }
+        return o;
     },
     // Cuánto ocupa PaseoCan en este celular (caracteres: clave + valor de TODO lo guardado, también la copia de la
     // nube). Se compara con LIMITE_ESPACIO (revisión de estabilidad, hallazgo 2a).
@@ -3604,6 +3766,7 @@ const storage = {
         Object.values(STORAGE_KEYS).forEach(k => {
             try {
                 localStorage.removeItem(k);
+                ESPEJO.anotar(k, null);
             }
             catch (_b) { }
         });
@@ -19733,6 +19896,29 @@ function App() {
         catch (e) { } };
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
+    // IndexedDB etapa 2: arranca el espejo (compara y copia) y, al irse de la app, escribe lo pendiente al toque.
+    useEffect(() => {
+        ESPEJO.iniciar(null, () => storage.crudos());
+        const ya = () => { try {
+            ESPEJO.vaciar();
+        }
+        catch (e) { } };
+        const vis = () => { try {
+            if (document.visibilityState === "hidden")
+                ya();
+        }
+        catch (e) { } };
+        try {
+            window.addEventListener("pagehide", ya);
+            document.addEventListener("visibilitychange", vis);
+        }
+        catch (e) { }
+        return () => { try {
+            window.removeEventListener("pagehide", ya);
+            document.removeEventListener("visibilitychange", vis);
+        }
+        catch (e) { } };
+    }, []);
     // Contador anónimo: al abrir y cuando vuelve la señal; si falla, se reintenta la próxima vez.
     useEffect(() => {
         const intentar = () => {
@@ -19752,17 +19938,21 @@ function App() {
             }
             if (typeof fetch !== "function")
                 return;
-            let uso;
-            try {
-                const ps = storage.load("pc_paseos", []);
-                const nb = storage.load("pc_nube", null);
-                uso = usoParaContar({ usado: storage.tamano(), limite: LIMITE_ESPACIO, paseos: Array.isArray(ps) ? ps.length : 0, nube: !!(nb && nb.ses) });
-            }
-            catch (e) {
-                uso = undefined;
-            }
-            contarApertura(fetch, { url: SUPA_URL, key: SUPA_KEY, inst, ver: APP_VER, uso }).then(ok => { if (ok)
-                storage.save("pc_contador_dia", hoy); });
+            // Espera (máx. 6 s) la comparación del espejo de IndexedDB, para mandar cómo dio.
+            const espera = Promise.race([ESPEJO.promesa || Promise.resolve(), new Promise(r => setTimeout(r, 6000))]);
+            espera.then(() => {
+                let uso;
+                try {
+                    const ps = storage.load("pc_paseos", []);
+                    const nb = storage.load("pc_nube", null);
+                    uso = usoParaContar({ usado: storage.tamano(), limite: LIMITE_ESPACIO, paseos: Array.isArray(ps) ? ps.length : 0, nube: !!(nb && nb.ses), idb: ESPEJO.resumen() });
+                }
+                catch (e) {
+                    uso = undefined;
+                }
+                return contarApertura(fetch, { url: SUPA_URL, key: SUPA_KEY, inst, ver: APP_VER, uso }).then(ok => { if (ok)
+                    storage.save("pc_contador_dia", hoy); });
+            }).catch(() => { });
         };
         intentar();
         try {
