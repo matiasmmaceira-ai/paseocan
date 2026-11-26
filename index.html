@@ -2460,7 +2460,7 @@ function nombreDato(k) { return NOMBRE_DATO[k] || k; }
 // HTML: la base solo deja hacer lo que permiten sus reglas (RLS). NUNCA poner acá la secret/service_role.
 const SUPA_URL = "https://zwuakvfsgesdeiioimcj.supabase.co";
 const SUPA_KEY = "sb_publishable_aIkR9AH_aUigZVcm_eNlKQ_1eMtomWx";
-const APP_VER = "2026-11-25c";
+const APP_VER = "2026-11-26a";
 // Contador anónimo (Matías: "¿vamos a saber cuánta gente la está usando?"): una vez por día que se abre
 // la app, manda un número al azar de este celular + la versión (desde el 21/11 también % de espacio, rango de
 // paseos y si usa la nube: ver usoParaContar). Sin nombre, mail ni datos de clientes o plata. La
@@ -18488,52 +18488,57 @@ function Onboarding({ onComplete, onSkip, onCreateGroup, onCreateClient, onServi
     const [svc, setSvc] = useState(null);
     const [tipoCobro, setTipoCobro] = useState(null);
     const Progress = () => (React.createElement("div", { style: { display: "flex", gap: 6, marginBottom: 24 } }, [0, 1, 3].map(i => (React.createElement("div", { key: i, style: { flex: 1, height: 4, borderRadius: 2, background: i <= step ? C.grn : C.bdr } })))));
+    // 26/11/2026 (Matías, capturas de los 3 pasos: "fijate manejar el mismo criterio"): los tres pasos con la MISMA
+    // forma: barra, "Paso N de 3", título y una línea que dice qué hacer; opciones con su marca a la derecha (cuadradito
+    // si se tildan varias, circulito si se elige una); y abajo, siempre a la vista, la misma fila: Atrás + el botón verde.
+    const Cabeza = ({ n, titulo, sub }) => (React.createElement(React.Fragment, null,
+        React.createElement(Progress, null),
+        React.createElement("div", { style: { fontSize: 12, color: C.grn, fontWeight: 800, textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 8 } }, "Paso " + n + " de 3"),
+        React.createElement("div", { style: { fontSize: 22, fontWeight: 800, color: C.txt, marginBottom: 8 } }, titulo),
+        React.createElement("div", { style: { fontSize: 13, color: C.mut, marginBottom: 16, lineHeight: 1.5 } }, sub)));
+    const Opcion = (_b) => {
+        var { on, ic, titulo, desc, radio, fijo, onClick } = _b, rest = __rest(_b, ["on", "ic", "titulo", "desc", "radio", "fijo", "onClick"]);
+        return (React.createElement("div", Object.assign({}, rest, { role: radio ? "radio" : "checkbox", "aria-checked": on, onClick: fijo ? undefined : onClick, style: { display: "flex", alignItems: "center", gap: 12, padding: 14, borderRadius: 14, border: `1.5px solid ${on ? C.grn : C.bdr}`, background: on ? C.grn + "14" : C.card, marginBottom: 10, cursor: fijo ? "default" : "pointer", textAlign: "left", color: C.txt } }),
+            ic && React.createElement("span", { "aria-hidden": "true", style: { fontSize: 22, flexShrink: 0 } }, ic),
+            React.createElement("span", { style: { flex: 1, minWidth: 0 } },
+                React.createElement("span", { style: { display: "block", fontSize: 15, fontWeight: 800, color: on && !fijo ? C.grn : C.txt } }, titulo),
+                desc && React.createElement("span", { style: { display: "block", fontSize: 12.5, color: C.mut, marginTop: 3, lineHeight: 1.4 } }, desc)),
+            fijo && React.createElement("span", { style: { fontSize: 12, color: C.grn, fontWeight: 800, flexShrink: 0 } }, fijo),
+            React.createElement("span", { "aria-hidden": "true", className: "pc-onb-marca", style: { flexShrink: 0, width: 24, height: 24, borderRadius: 12, border: `2px solid ${on ? C.grn : C.mut}`, background: on ? C.grn : "transparent", color: C.bg, fontWeight: 900, fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center" } }, on ? "✓" : "")));
+    };
+    const Pie = ({ onAtras, id, lbl, onOk, apagado, abajo }) => (React.createElement("div", { className: "pc-onb-pie", style: { position: "sticky", bottom: -20, margin: "16px -20px -20px", padding: "12px 20px 20px", background: C.bg, borderTop: `1px solid ${C.bdr}` } },
+        React.createElement("div", { style: { display: "flex", gap: 8 } },
+            React.createElement("button", { className: "pc-onb-atras", onClick: onAtras, style: Object.assign(Object.assign({}, BR("secundario", false)), { flex: 1 }) }, "Atrás"),
+            React.createElement("button", { id: id, onClick: onOk, style: apagado ? Object.assign(Object.assign({}, BR("secundario", false)), { flex: 2 }) : Object.assign(Object.assign({}, Btn(C.grn, "#0f1a14")), { flex: 2 }) }, lbl)),
+        abajo));
     return (React.createElement("div", { style: { position: "fixed", inset: 0, background: C.bg, zIndex: 300, padding: 20, display: "flex", flexDirection: "column", maxWidth: 480, margin: "0 auto", overflowY: "auto" } },
         step === 0 && svc && (React.createElement("div", { id: "pc-onb-servicios", style: { flex: 1, display: "flex", flexDirection: "column" } },
-            React.createElement(Progress, null),
-            React.createElement("div", { style: { fontSize: 12, color: C.grn, fontWeight: 800, textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 8 } }, "Paso 1 de 3"),
-            React.createElement("div", { style: { fontSize: 22, fontWeight: 800, color: C.txt, marginBottom: 8 } }, "¿Qué servicios das?"),
-            React.createElement("div", { style: { fontSize: 13, color: C.mut, marginBottom: 16, lineHeight: 1.5 } }, "Los paseos van siempre. Tildá lo demás que hagas: la app te muestra solo eso. Lo cambiás cuando quieras en ☰ > Configuración > Servicios."),
-            React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 10, padding: "12px", borderRadius: 12, border: `1.5px solid ${C.grn}`, background: C.grn + "14", marginBottom: 8 } },
-                React.createElement("span", { style: { fontSize: 22 } }, "🐾"),
-                React.createElement("span", { style: { flex: 1, fontSize: 15, fontWeight: 800, color: C.txt } }, "Paseos"),
-                React.createElement("span", { style: { fontSize: 12, color: C.grn, fontWeight: 800 } }, "Siempre")),
+            React.createElement(Cabeza, { n: 1, titulo: "¿Qué servicios das?", sub: "Los paseos van siempre. Tildá lo demás que hagas (podés tildar varios): la app te muestra solo eso. Lo cambiás cuando quieras en ☰ > Configuración > Servicios." }),
+            React.createElement(Opcion, { on: true, ic: "🐾", titulo: "Paseos", fijo: "Siempre" }),
             SERVICIOS.map(([k, ic, t, d]) => {
                 const on = !!svc[k];
-                return (React.createElement("button", { key: k, className: "pc-onb-svc", "data-k": k, "data-on": on ? "1" : "0", onClick: () => setSvc(x => (Object.assign(Object.assign({}, x), { [k]: !x[k] }))), style: { display: "flex", alignItems: "center", gap: 10, padding: "12px", borderRadius: 12, border: `1.5px solid ${on ? C.grn : C.bdr}`, background: on ? C.grn + "14" : "transparent", marginBottom: 8, cursor: "pointer", textAlign: "left", color: C.txt } },
-                    React.createElement("span", { style: { fontSize: 22 } }, ic),
-                    React.createElement("span", { style: { flex: 1, minWidth: 0 } },
-                        React.createElement("span", { style: { display: "block", fontSize: 15, fontWeight: 800 } }, t),
-                        React.createElement("span", { style: { display: "block", fontSize: 12, color: C.mut, marginTop: 2 } }, d)),
-                    React.createElement("span", { style: { width: 22, height: 22, borderRadius: 6, border: `1.5px solid ${on ? C.grn : C.dim}`, background: on ? C.grn : "transparent", color: C.bg, fontWeight: 900, fontSize: 14, lineHeight: "20px", textAlign: "center", flexShrink: 0 } }, on ? "✓" : "")));
+                return (React.createElement(Opcion, { key: k, className: "pc-onb-svc", "data-k": k, "data-on": on ? "1" : "0", on: on, ic: ic, titulo: t, desc: d, onClick: () => setSvc(x => (Object.assign(Object.assign({}, x), { [k]: !x[k] }))) }));
             }),
-            React.createElement("button", { id: "pc-onb-svc-ok", onClick: () => { paso("bv1"); onServicios && onServicios(svc); setSvc(null); setStep(1); }, style: Object.assign(Object.assign({}, BR("primario", false)), { width: "100%", fontSize: 15, padding: "14px 20px", marginTop: 8 }) }, "Seguir"))),
+            React.createElement("div", { style: { flex: 1 } }),
+            React.createElement(Pie, { onAtras: () => setSvc(null), id: "pc-onb-svc-ok", lbl: "Siguiente", onOk: () => { paso("bv1"); onServicios && onServicios(svc); setStep(1); } }))),
         step === 0 && !svc && (React.createElement("div", { style: { flex: 1, display: "flex", flexDirection: "column", justifyContent: "center", textAlign: "center" } },
             React.createElement("div", { style: { fontSize: 48, marginBottom: 16 } }, "🐕"),
             React.createElement("div", { style: { fontSize: 28, fontWeight: 800, color: C.txt, marginBottom: 12 } }, "Bienvenido a PaseoCan"),
             React.createElement("div", { style: { fontSize: 15, color: C.mut, marginBottom: 32, lineHeight: 1.5 } }, "Vamos a dejarte armado en 3 pasos. Al terminar vas a tener tu primer cliente y perro listos."),
-            React.createElement("button", { id: "pc-onb-empezar", onClick: () => { paso("bv0"); onServicios ? setSvc({ est: false, cla: false, ven: false, rut: false }) : setStep(1); }, style: Object.assign(Object.assign({}, BR("primario", false)), { width: "100%", fontSize: 15, padding: "14px 20px" }) }, "Empezar"),
+            React.createElement("button", { id: "pc-onb-empezar", onClick: () => { paso("bv0"); onServicios ? setSvc(x => x || { est: false, cla: false, ven: false, rut: false }) : setStep(1); }, style: Object.assign(Object.assign({}, BR("primario", false)), { width: "100%", fontSize: 15, padding: "14px 20px" }) }, "Empezar"),
             onYaUso && React.createElement("button", { id: "pc-onb-yauso", onClick: () => { paso("bvYaUso"); onYaUso(); }, style: { marginTop: 14, background: C.card, border: `1px solid ${C.grn}`, color: C.grn, borderRadius: 12, fontSize: 14, fontWeight: 700, cursor: "pointer", padding: "12px 16px", width: "100%", fontFamily: "inherit" } }, "☁️ ¿Ya usás PaseoCan? Entrá con tu mail"),
             React.createElement("button", { id: "pc-onb-saltar", onClick: () => { paso("bvSalto"); onSkip(); }, style: { background: "transparent", border: "none", color: C.mut, marginTop: 10, fontSize: 13, cursor: "pointer", padding: 10 } }, "Saltar y configurar después"))),
         step === 1 && (React.createElement("div", { style: { flex: 1, display: "flex", flexDirection: "column" } },
-            React.createElement(Progress, null),
-            React.createElement("div", { style: { fontSize: 12, color: C.grn, fontWeight: 800, textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 8 } }, "Paso 2 de 3"),
-            React.createElement("div", { style: { fontSize: 22, fontWeight: 800, color: C.txt, marginBottom: 8 } }, "¿Cómo cobrás a tus clientes?"),
-            React.createElement("div", { style: { fontSize: 13, color: C.mut, marginBottom: 24 } }, "Podés elegir distinto para cada cliente después."),
-            ONB_COBRO.map(opt => (React.createElement("div", { key: opt.id, onClick: () => setTipoCobro(opt.id), style: { background: C.card, borderRadius: 14, padding: 16, marginBottom: 10, cursor: "pointer", border: `${tipoCobro === opt.id ? 2 : 1}px solid ${tipoCobro === opt.id ? C.grn : C.bdr}` } },
-                React.createElement("div", { style: { fontWeight: 800, fontSize: 15, color: tipoCobro === opt.id ? C.grn : C.txt, marginBottom: 4 } }, opt.titulo),
-                React.createElement("div", { style: { fontSize: 13, color: C.mut, lineHeight: 1.4 } }, opt.desc)))),
+            React.createElement(Cabeza, { n: 2, titulo: "¿Cómo cobrás a tus clientes?", sub: "Tocá la que más usás (una sola). Después podés elegir distinto para cada cliente." }),
+            React.createElement("div", { role: "radiogroup", "aria-label": "Cómo cobrás" }, ONB_COBRO.map(opt => (React.createElement(Opcion, { key: opt.id, className: "pc-onb-cobro-op", "data-k": opt.id, radio: true, on: tipoCobro === opt.id, titulo: opt.titulo, desc: opt.desc, onClick: () => setTipoCobro(opt.id) })))),
             React.createElement("div", { style: { flex: 1 } }),
-            React.createElement("div", { style: { display: "flex", gap: 8, marginTop: 16 } },
-                React.createElement("button", { onClick: () => setStep(0), style: Object.assign(Object.assign({}, BR("secundario", false)), { flex: 1 }) }, "Atrás"),
-                React.createElement("button", { id: "pc-onb-cobro-ok", onClick: () => { paso("bv2"); onCobro && onCobro(tipoCobro); setStep(3); }, disabled: !tipoCobro, style: Object.assign(Object.assign({}, Btn(tipoCobro ? C.grn : C.bdr, tipoCobro ? "#0f1a14" : C.mut)), { flex: 2 }) }, "Siguiente")))),
-        step === 3 && (React.createElement("div", { style: { flex: 1, display: "flex", flexDirection: "column", justifyContent: "center", textAlign: "center" } },
-            React.createElement("div", { style: { fontSize: 48, marginBottom: 16 } }, "✅"),
-            React.createElement("div", { style: { fontSize: 24, fontWeight: 800, color: C.txt, marginBottom: 12 } }, "¡Listo!"),
-            React.createElement("div", { style: { fontSize: 14, color: C.mut, marginBottom: 8, lineHeight: 1.5 } }, "Ahora cargá tu primer cliente con su perro: qué días sale, cuánto te paga y cómo."),
-            React.createElement("div", { style: { fontSize: 13, color: "#86efac", marginBottom: 32, lineHeight: 1.5, background: "#0a1a14", border: "1px dashed #22c55e44", borderRadius: 14, padding: 14 } }, "Después, desde la Agenda, lo ubicás en un recorrido (con quién y a qué hora sale) cuando quieras."),
-            React.createElement("button", { onClick: () => { onCreateClient(); onComplete(); }, style: Object.assign(Object.assign({}, BR("primario", false)), { width: "100%", fontSize: 15, padding: "14px 20px" }) }, "Cargar primer cliente"),
-            React.createElement("button", { onClick: onComplete, style: { background: "transparent", border: "none", color: C.mut, marginTop: 10, fontSize: 13, cursor: "pointer", padding: 10 } }, "Saltar y hacerlo después")))));
+            React.createElement(Pie, { onAtras: () => setStep(0), id: "pc-onb-cobro-ok", apagado: !tipoCobro, lbl: tipoCobro ? "Siguiente" : "Elegir después", onOk: () => { paso("bv2"); if (tipoCobro && onCobro)
+                    onCobro(tipoCobro); setStep(3); } }))),
+        step === 3 && (React.createElement("div", { style: { flex: 1, display: "flex", flexDirection: "column" } },
+            React.createElement(Cabeza, { n: 3, titulo: "¡Listo! Ahora tu primer cliente", sub: "Cargá un cliente con su perro: qué días sale, cuánto te paga y cómo. Es lo único que falta para empezar." }),
+            React.createElement("div", { style: { fontSize: 13, color: "#86efac", lineHeight: 1.5, background: "#0a1a14", border: "1px dashed #22c55e44", borderRadius: 14, padding: 14 } }, "Después, desde la Agenda, lo ubicás en un recorrido (con quién y a qué hora sale) cuando quieras."),
+            React.createElement("div", { style: { flex: 1 } }),
+            React.createElement(Pie, { onAtras: () => setStep(1), id: "pc-onb-cliente", lbl: "Cargar primer cliente", onOk: () => { onCreateClient(); onComplete(); }, abajo: React.createElement("button", { id: "pc-onb-despues", onClick: onComplete, style: { display: "block", margin: "8px auto 0", background: "transparent", border: "none", color: C.mut, fontSize: 13, cursor: "pointer", padding: 8, fontFamily: "inherit" } }, "Lo hago después") })))));
 }
 /* └── FIN: screens/Onboarding.jsx ───────────────────────────────────────── */
 /* ── Tutoriales guiados (crean el dato real mientras explican) ───────────── */
