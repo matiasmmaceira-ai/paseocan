@@ -1156,6 +1156,11 @@ function cfgLugares(cfg) { return Array.isArray(cfg && cfg.lugares) ? cfg.lugare
 const TEXT_SCALES = [[1, "Normal"], [1.15, "Grande"], [1.3, "Más grande"], [1.5, "Máximo"]];
 // Normaliza cualquier valor guardado a uno de los escalones válidos (default 1).
 const normScale = v => { const n = Number(v); return TEXT_SCALES.some(s => s[0] === n) ? n : 1; };
+// ── PANTALLA ANCHA (26/11/2026, versión para PC, parte 1 — maqueta aprobada el 21/11: "Me re gusta") ──
+// Una sola app que se acomoda: con 900 px o más (ya descontado el tamaño de letra) la barra de secciones va al
+// costado y el contenido usa más ancho. En el celular no cambia nada.
+const PC_DESDE = 900;
+function modoPantalla(anchoCss) { return (Number(anchoCss) || 0) >= PC_DESDE ? "pc" : "cel"; }
 // Items predefinidos de "qué pedir que traigan" en una estadía. La config guarda
 // las keys tildadas (traerPredef) + textos libres (traerOtros); la estadía hereda
 // una copia RESUELTA a labels (campo opcional `traer:[]`, default [] en lectura).
@@ -2481,10 +2486,16 @@ const STORAGE_KEYS = {
     EDGE_MEMORY: "pc_edge_memory",
     EDGE_MEM_MIGRATED: "pc_edge_memory_migrated_v1",
 };
+// DATOS_NEGOCIO (26/11/2026, BUG-110): todo lo que "Borrar todos los datos" tiene que borrar. Antes storage.clear()
+// borraba solo STORAGE_KEYS y quedaban clases, ventas, artículos, congeladas, ajustes por período y partes: tras
+// borrar, la app mostraba 0 clientes pero "Cobrado este mes $185.000". Se dejan a propósito: configuración,
+// plantillas de WhatsApp, tutoriales vistos, el número anónimo del contador y la sesión de la nube (esa la maneja
+// "salir de la nube" del mismo Borrar todo).
+const DATOS_NEGOCIO = [...Object.values(STORAGE_KEYS), "pc_adiestramiento", "pc_articulos", "pc_ventas", "pc_congeladas", "pc_ajperiodo", "pc_partes"];
 // ── Salud del guardado (24/10/2026) ──
 // fallos: clave → motivo del último guardado fallido. pendiente: clave → valor sin guardar.
 // danados: claves que no se pudieron leer (se guardó copia en pc_danado_<clave>).
-const PC_SALUD = { fallos: {}, pendiente: {}, danados: [] };
+const PC_SALUD = { fallos: {}, pendiente: {}, danados: [], enCopia: {} };
 function avisarSalud() { try {
     window.dispatchEvent(new Event("pc-salud"));
 }
@@ -2496,7 +2507,7 @@ function nombreDato(k) { return NOMBRE_DATO[k] || k; }
 // HTML: la base solo deja hacer lo que permiten sus reglas (RLS). NUNCA poner acá la secret/service_role.
 const SUPA_URL = "https://zwuakvfsgesdeiioimcj.supabase.co";
 const SUPA_KEY = "sb_publishable_aIkR9AH_aUigZVcm_eNlKQ_1eMtomWx";
-const APP_VER = "2026-11-26b";
+const APP_VER = "2026-11-26c";
 // Contador anónimo (Matías: "¿vamos a saber cuánta gente la está usando?"): una vez por día que se abre
 // la app, manda un número al azar de este celular + la versión (desde el 21/11 también % de espacio, rango de
 // paseos y si usa la nube: ver usoParaContar). Sin nombre, mail ni datos de clientes o plata. La
@@ -2522,16 +2533,46 @@ function rangoPaseos(n) { n = Number(n) || 0; return n <= 0 ? "0" : n < 100 ? "1
 // idb (21/11, IndexedDB etapa 2): cómo dio la comparación del espejo al abrir (ok / nuevo / dif:N / sin / falla).
 function usoParaContar({ usado, limite, paseos, nube, idb }) { const u = { esp: espacioPct(usado, limite), pas: rangoPaseos(paseos), nube: !!nube }; if (idb)
     u.idb = String(idb).slice(0, 12); return u; }
+// ── MÉTRICAS DE USO (26/11/2026, DISEÑO_metricas.md, Matías: "Daleee") ──
+// Para separar a quien ABRE de quien USA: la fila diaria suma, SIEMPRE EN RANGOS y sin nada privado,
+// si terminó la bienvenida, cuántos clientes y perros activos tiene y cuántos paseos COMPLETÓ en los últimos 7 días.
+// (Cobros de la semana: no se manda; los paseos no guardan la fecha del cobro. "Cobró alguna vez" ya está en pasos.)
+function rangoCant(n, cortes) { n = Number(n) || 0; if (n <= 0)
+    return "0"; for (let i = 0; i < cortes.length; i++) {
+    if (n < cortes[i])
+        return (i ? cortes[i - 1] : 1) + "-" + (cortes[i] - 1);
+} return cortes[cortes.length - 1] + "+"; }
+const rangoClientes = n => rangoCant(n, [5, 10, 20]); // 0 / 1-4 / 5-9 / 10-19 / 20+
+const rangoHechos7 = n => rangoCant(n, [10, 30, 60]); // 0 / 1-9 / 10-29 / 30-59 / 60+
+function actividadParaContar({ onboardingDone, clients, dogs, paseos, hoy }) {
+    const H = hoy || td(), desde = addDays(H, -6);
+    const cls = (clients || []).filter(c => c && !c.archivado && !c.baja);
+    const ids = new Set(cls.map(c => c.id));
+    const per = (dogs || []).filter(d => d && !d.baja && ids.has(d.cid)).length;
+    const h7 = (paseos || []).filter(p => p && p.status === "completado" && p.fecha >= desde && p.fecha <= H).length;
+    return { onb: !!onboardingDone, cli: rangoClientes(cls.length), per: rangoClientes(per), h7: rangoHechos7(h7) };
+}
+// El día del contador es el MISMO que anota la base (UTC). Antes era el de Argentina: después de las 21 h los días
+// se corrían y quien abría a la noche y a la mañana siguiente contaba un solo día.
+function hoyUTC(ahora) { try {
+    return new Date(ahora == null ? Date.now() : ahora).toISOString().slice(0, 10);
+}
+catch (e) {
+    return td();
+} }
 async function contarApertura(fetchFn, { url, key, inst, ver, uso }) {
     const mandar = async (body) => fetchFn(url + "/rest/v1/aperturas", { method: "POST", headers: { apikey: key, "Content-Type": "application/json", Prefer: "return=minimal" }, body: JSON.stringify(body) });
-    // 400 = a la tabla le faltan columnas: se prueba con menos (sin idb; después solo inst y versión). Nunca deja de contar.
+    // 400 = a la tabla le faltan columnas: se prueba con menos (sin las de actividad; sin idb; solo inst y versión).
+    // Nunca deja de contar, aunque el alter table no se haya corrido.
     const intentos = [];
     if (uso) {
-        intentos.push(Object.assign({ inst, ver }, uso));
-        if ("idb" in uso) {
-            const { idb } = uso, sinIdb = __rest(uso, ["idb"]);
-            intentos.push(Object.assign({ inst, ver }, sinIdb));
-        }
+        let u = Object.assign({}, uso);
+        intentos.push(Object.assign({ inst, ver }, u));
+        [["onb", "cli", "per", "h7"], ["idb"]].forEach(gr => { if (gr.some(k => k in u)) {
+            u = Object.assign({}, u);
+            gr.forEach(k => { delete u[k]; });
+            intentos.push(Object.assign({ inst, ver }, u));
+        } });
     }
     intentos.push({ inst, ver });
     try {
@@ -3510,6 +3551,16 @@ async function guardarBaseSync({ db, enIdb, base, guardarLS, borrarLS }) {
 // Escribe de a tandas (1 s) para no frenar la app; al irse de la app escribe al toque. Todo con tiempo límite y sin
 // tirar errores; si IndexedDB no anda, el espejo se apaga solo ("sin").
 const ESPEJO_PREF = "ls:";
+const ESPEJO_ADEL = "ad:"; // etapa 3: "esta clave está más nueva en IndexedDB que en localStorage" (valor = hora)
+// Hora de la última vez que localStorage SÍ guardó una clave que tenía marca: si la app se cerró antes de que se
+// borrara la marca en IndexedDB, al abrir gana lo más nuevo (no se pisa lo bueno con la copia vieja).
+const LS_HORA_PREF = "pc_lst:";
+let ahoraMsEspejo = () => Date.now();
+function idbLoteCrudo(db, ops, tm) {
+    if (!db || !ops.length)
+        return Promise.resolve({ ok: !!db });
+    return idbPedido(db, "readwrite", st => { let rq; ops.forEach(([k, v]) => { rq = v === null ? st.delete(k) : st.put(v, k); }); return rq; }, 8000, tm);
+}
 function idbLote(db, ops, tm) {
     if (!db || !ops.length)
         return Promise.resolve({ ok: !!db });
@@ -3531,11 +3582,17 @@ function idbLeerEspejo(db, tm) {
             const st = tx.objectStore(IDB_ALMACEN);
             const out = {};
             const rk = st.getAllKeys();
-            rk.onsuccess = () => { (rk.result || []).forEach(k => { if (typeof k === "string" && k.indexOf(ESPEJO_PREF) === 0) {
+            const adel = {};
+            rk.onsuccess = () => { (rk.result || []).forEach(k => { if (typeof k !== "string")
+                return; if (k.indexOf(ESPEJO_ADEL) === 0) {
+                const g = st.get(k);
+                g.onsuccess = () => { adel[k.slice(ESPEJO_ADEL.length)] = g.result; };
+                return;
+            } if (k.indexOf(ESPEJO_PREF) === 0) {
                 const g = st.get(k);
                 g.onsuccess = () => { out[k.slice(ESPEJO_PREF.length)] = g.result; };
             } }); };
-            tx.oncomplete = () => { T.clear(t); fin({ ok: true, val: out }); };
+            tx.oncomplete = () => { T.clear(t); fin({ ok: true, val: out, adel }); };
             tx.onerror = () => { T.clear(t); fin({ ok: false }); };
             tx.onabort = () => { T.clear(t); fin({ ok: false }); };
         }
@@ -3569,10 +3626,17 @@ function resumenEspejo(r) { if (!r)
     return "pend"; if (r.estado === "dif")
     return "dif:" + (r.distintas.length + r.faltan.length + r.sobran.length); return r.estado; }
 function crearEspejo() {
-    const E = { db: null, listo: false, apagado: false, cola: new Map(), timer: null, res: null, promesa: null, tm: null, escribiendo: Promise.resolve() };
+    const E = { db: null, listo: false, apagado: false, cola: new Map(), timer: null, res: null, promesa: null, tm: null, escribiendo: Promise.resolve(),
+        adel: new Set(), marcadas: new Set(), onAdelante: null };
+    // Etapa 3 (26/11): anotar = se guardó bien en localStorage (si tenía marca "va adelante", se saca).
+    // anotarAdelante = localStorage NO lo pudo guardar (sin espacio): va solo a IndexedDB con la marca "ad:<clave>",
+    // así al abrir se sabe que la copia interna es la más nueva. Devuelve false si el espejo no anda.
     E.anotar = (k, txt) => { if (E.apagado || !k || k === IDB_BASE)
-        return; E.cola.set(k, txt); if (E.listo && !E.timer)
+        return; E.cola.set(k, txt); E.adel.delete(k); if (E.listo && !E.timer)
         E.timer = (E.tm || IDB_TM).set(() => { E.timer = null; E.vaciar(); }, 1000); };
+    E.anotarAdelante = (k, txt) => { if (E.apagado || !k || k === IDB_BASE)
+        return false; E.cola.set(k, txt); E.adel.add(k); if (E.listo && !E.timer)
+        E.timer = (E.tm || IDB_TM).set(() => { E.timer = null; E.vaciar(); }, 1000); return true; };
     E.vaciar = () => {
         if (!E.listo || E.apagado || !E.cola.size)
             return E.escribiendo;
@@ -3582,8 +3646,25 @@ function crearEspejo() {
         }
         const ops = [...E.cola];
         E.cola.clear();
-        E.escribiendo = E.escribiendo.then(() => idbLote(E.db, ops, E.tm)).then(r => { if (!r.ok) {
+        const adel = ops.filter(([k]) => E.adel.has(k)).map(([k]) => k);
+        const marcas = [];
+        ops.forEach(([k]) => { if (E.adel.has(k)) {
+            marcas.push([ESPEJO_ADEL + k, String(ahoraMsEspejo())]);
+            E.marcadas.add(k);
+        }
+        else if (E.marcadas.has(k)) {
+            marcas.push([ESPEJO_ADEL + k, null]);
+            E.marcadas.delete(k);
+        } });
+        adel.forEach(k => E.adel.delete(k));
+        E.escribiendo = E.escribiendo.then(() => idbLoteCrudo(E.db, ops.map(([k, v]) => [ESPEJO_PREF + k, v]).concat(marcas), E.tm)).then(r => { if (!r.ok) {
             E.res = { estado: "falla" };
+        }
+        else if (adel.length && E.onAdelante) {
+            try {
+                E.onAdelante(adel);
+            }
+            catch (e) { }
         } }).catch(() => { });
         return E.escribiendo;
     };
@@ -3615,6 +3696,7 @@ function crearEspejo() {
                 return E.res;
             }
             const cmp = compararEspejo(ls, r.val, [...E.cola.keys()]);
+            Object.keys(r.adel || {}).forEach(k => E.marcadas.add(k));
             const ops = Object.keys(ls).map(k => [k, ls[k]]).concat(Object.keys(r.val).filter(k => !(k in ls)).map(k => [k, null]));
             const w = await idbLote(db, ops, tm);
             if (!w.ok) {
@@ -3634,6 +3716,117 @@ function crearEspejo() {
     return E;
 }
 const ESPEJO = crearEspejo();
+// ═══ IndexedDB — etapa 3: LA COPIA INTERNA RESCATA (26/11/2026, Matías: "hacé la etapa 3 ahora, mejor ahora que hay
+// pocos usuarios") ═══
+// La app sigue trabajando con localStorage mientras ande. IndexedDB pasa a ser la red:
+//  a) Si localStorage no puede guardar (celular sin espacio), el cambio va igual a IndexedDB con la marca "ad:".
+//     Antes ese cambio se perdía al cerrar la app. Al abrir, lo marcado se toma de IndexedDB.
+//  b) Si localStorage aparece VACÍO (sin clientes ni perros) y la copia interna tiene datos, se recuperan de ahí.
+// Lo que no entra en localStorage queda en memoria (PC_SOBRE) y storage.load lo lee de ahí: la app ve siempre lo más nuevo.
+const PC_SOBRE = new Map();
+// Cuando IndexedDB confirma que guardó lo que localStorage no pudo, ya no se pierde: se saca el cartel rojo.
+ESPEJO.onAdelante = ks => { let c = false; ks.forEach(k => { if (PC_SALUD.fallos[k] !== undefined) {
+    delete PC_SALUD.fallos[k];
+    delete PC_SALUD.pendiente[k];
+    PC_SALUD.enCopia[k] = 1;
+    c = true;
+} }); if (c)
+    avisarSalud(); };
+const PC_RESCATE = { n: 0, motivo: null };
+// decidirRescate(ls, espejo, marcas {clave: hora}): {usar:{clave:texto}, motivo:null|"adelante"|"vacio"}. Pura.
+// Una marca vale solo si es más nueva que la última vez que localStorage guardó esa clave (pc_lst:<clave>).
+function decidirRescate(ls, esp, adel) {
+    const L = ls || {}, E = esp || {};
+    const usar = {};
+    const tieneDatos = x => { try {
+        const v = JSON.parse(x);
+        return Array.isArray(v) && v.length > 0;
+    }
+    catch (e) {
+        return false;
+    } };
+    if (!("pc_clients" in L) && !("pc_dogs" in L) && (tieneDatos(E.pc_clients) || tieneDatos(E.pc_dogs))) {
+        Object.keys(E).forEach(k => { if (k !== IDB_BASE && k.indexOf("pc_danado_") !== 0 && E[k] != null)
+            usar[k] = E[k]; });
+        return { usar, motivo: "vacio" };
+    }
+    Object.keys(adel || {}).forEach(k => {
+        const t = Number(adel[k]) || 0, tl = Number(L[LS_HORA_PREF + k]) || 0;
+        if (k in E && E[k] != null && E[k] !== L[k] && t > tl)
+            usar[k] = E[k];
+    });
+    return { usar, motivo: Object.keys(usar).length ? "adelante" : null };
+}
+// Al abrir, ANTES de dibujar la app. Nunca tira error ni tarda más de unos segundos: sin IndexedDB sigue como siempre.
+// Para no frenar el arranque: primero solo las CLAVES (rápido); los valores se leen únicamente si hace falta (hay
+// marcas, o localStorage vacío con copia). En el día a día no se lee nada más.
+function idbClaves(db, tm) { if (!db)
+    return Promise.resolve({ ok: false }); return idbPedido(db, "readonly", st => st.getAllKeys(), 4000, tm); }
+function idbLeerVarias(db, ks, tm) {
+    if (!db)
+        return Promise.resolve({ ok: false });
+    if (!ks.length)
+        return Promise.resolve({ ok: true, val: {} });
+    const T = tm || IDB_TM;
+    return new Promise(res => {
+        let listo = false;
+        const fin = v => { if (!listo) {
+            listo = true;
+            res(v);
+        } };
+        const t = T.set(() => fin({ ok: false }), 8000);
+        try {
+            const tx = db.transaction(IDB_ALMACEN, "readonly");
+            const st = tx.objectStore(IDB_ALMACEN);
+            const out = {};
+            ks.forEach(k => { const g = st.get(k); g.onsuccess = () => { out[k] = g.result; }; });
+            tx.oncomplete = () => { T.clear(t); fin({ ok: true, val: out }); };
+            tx.onerror = () => { T.clear(t); fin({ ok: false }); };
+            tx.onabort = () => { T.clear(t); fin({ ok: false }); };
+        }
+        catch (e) {
+            T.clear(t);
+            fin({ ok: false });
+        }
+    });
+}
+async function rescatarDeEspejo({ fac, tm, leerLS, escribirLS }) {
+    try {
+        const db = await idbAbrir(fac, 3000, tm);
+        if (!db)
+            return { n: 0, motivo: null };
+        const rk = await idbClaves(db, tm);
+        if (!rk.ok)
+            return { n: 0, motivo: null };
+        const ks = (rk.val || []).filter(k => typeof k === "string");
+        const adelK = ks.filter(k => k.indexOf(ESPEJO_ADEL) === 0).map(k => k.slice(ESPEJO_ADEL.length));
+        let ls = {};
+        try {
+            ls = leerLS() || {};
+        }
+        catch (e) { }
+        const vacio = !("pc_clients" in ls) && !("pc_dogs" in ls) && (ks.indexOf(ESPEJO_PREF + "pc_clients") >= 0 || ks.indexOf(ESPEJO_PREF + "pc_dogs") >= 0);
+        if (!vacio && !adelK.length)
+            return { n: 0, motivo: null }; // lo normal: nada que leer
+        const pedir = vacio ? ks.filter(k => k.indexOf(ESPEJO_PREF) === 0) : adelK.map(k => ESPEJO_PREF + k).concat(adelK.map(k => ESPEJO_ADEL + k));
+        const rv = await idbLeerVarias(db, pedir, tm);
+        if (!rv.ok)
+            return { n: 0, motivo: null };
+        const esp = {}, adel = {};
+        Object.keys(rv.val).forEach(k => { if (k.indexOf(ESPEJO_PREF) === 0)
+            esp[k.slice(ESPEJO_PREF.length)] = rv.val[k];
+        else if (k.indexOf(ESPEJO_ADEL) === 0)
+            adel[k.slice(ESPEJO_ADEL.length)] = rv.val[k]; });
+        const d = decidirRescate(ls, esp, adel);
+        let n = 0;
+        Object.keys(d.usar).forEach(k => { n++; if (!escribirLS(k, d.usar[k]))
+            PC_SOBRE.set(k, d.usar[k]); });
+        return { n, motivo: d.motivo };
+    }
+    catch (e) {
+        return { n: 0, motivo: null };
+    }
+}
 // ¿Los mismos datos? Sin mirar la hora del backup, la versión ni las marcas de la nube.
 function syncMismosDatos(a, b) {
     const A = a || {}, B = b || {};
@@ -3784,11 +3977,15 @@ const storage = {
     load(key, fallback) {
         const fb = () => (typeof fallback === "function" ? fallback() : fallback);
         let raw = null;
-        try {
-            raw = localStorage.getItem(key);
-        }
-        catch (_b) {
-            return fb();
+        if (PC_SOBRE.has(key))
+            raw = PC_SOBRE.get(key); // etapa 3: lo que no entró en localStorage
+        else {
+            try {
+                raw = localStorage.getItem(key);
+            }
+            catch (_b) {
+                return fb();
+            }
         }
         if (!raw || raw === "null")
             return fb();
@@ -3814,21 +4011,47 @@ const storage = {
     // save devuelve true/false. Si falla (celular sin espacio, modo incógnito...) se anota la clave
     // y el ÚLTIMO valor que no se pudo guardar, para el cartel rojo y el botón "Reintentar".
     save(key, value) {
+        let txt;
         try {
-            const txt = JSON.stringify(value);
+            txt = JSON.stringify(value);
             localStorage.setItem(key, txt);
-            ESPEJO.anotar(key, txt); // IndexedDB etapa 2: copia (no se lee)
+            PC_SOBRE.delete(key);
+            if (ESPEJO.marcadas.has(key)) {
+                try {
+                    localStorage.setItem(LS_HORA_PREF + key, String(ahoraMsEspejo()));
+                }
+                catch (e2) { }
+            }
+            ESPEJO.anotar(key, txt); // IndexedDB: copia
             if (PC_SALUD.fallos[key] !== undefined) {
                 delete PC_SALUD.fallos[key];
                 delete PC_SALUD.pendiente[key];
+                delete PC_SALUD.enCopia[key];
                 avisarSalud();
             }
             return true;
         }
         catch (e) {
+            // Etapa 3: no entró en localStorage → va a la copia interna (IndexedDB) con su marca. El cartel rojo se saca
+            // solo cuando IndexedDB confirma que lo guardó (ESPEJO.onAdelante); si no hay IndexedDB queda como antes.
+            if (txt !== undefined) {
+                PC_SOBRE.set(key, txt);
+                ESPEJO.anotarAdelante(key, txt);
+            }
             PC_SALUD.fallos[key] = (e && e.name) || "error";
             PC_SALUD.pendiente[key] = value;
             avisarSalud();
+            return false;
+        }
+    },
+    // Etapa 3: el rescate al abrir escribe el texto tal cual (ya viene de la copia interna). true si entró.
+    escribirCrudo(key, txt) {
+        try {
+            localStorage.setItem(key, txt);
+            PC_SOBRE.delete(key);
+            return true;
+        }
+        catch (e) {
             return false;
         }
     },
@@ -3845,6 +4068,7 @@ const storage = {
         }
     },
     remove(key) {
+        PC_SOBRE.delete(key);
         try {
             localStorage.removeItem(key);
             ESPEJO.anotar(key, null);
@@ -3862,13 +4086,15 @@ const storage = {
             }
         }
         catch (_b) { }
+        PC_SOBRE.forEach((v, k) => { if (out.indexOf(k) < 0)
+            out.push(k); });
         return out;
     },
     // Todo lo guardado tal cual (texto), para el espejo de IndexedDB (etapa 2).
     crudos() {
         const o = {};
         try {
-            this.todas().forEach(k => { const v = localStorage.getItem(k); if (v != null)
+            this.todas().forEach(k => { const v = PC_SOBRE.has(k) ? PC_SOBRE.get(k) : localStorage.getItem(k); if (v != null)
                 o[k] = v; });
         }
         catch (_b) { }
@@ -3888,13 +4114,15 @@ const storage = {
         return Object.values(STORAGE_KEYS);
     },
     clear() {
-        Object.values(STORAGE_KEYS).forEach(k => {
+        DATOS_NEGOCIO.forEach(k => {
+            PC_SOBRE.delete(k);
             try {
                 localStorage.removeItem(k);
                 ESPEJO.anotar(k, null);
             }
             catch (_b) { }
         });
+        ESPEJO.vaciar(); // al toque: si se cierra la app enseguida, la copia interna no tiene que "rescatar" lo borrado
     },
 };
 // Aliases backwards-compatibles. Mismo comportamiento que antes.
@@ -4791,14 +5019,16 @@ function correrPendientes(a, fechaNueva, T) {
     const out = Object.assign(Object.assign({}, b), { pausas, movidas, omitidas, horasMovidas, nClases });
     // Notas de las que faltan (sin dictar, por ejemplo una nota previa): van con su clase, en orden.
     const nuevas = adiestraFechas(out).filter(f => f >= fechaNueva);
+    // De una sola vez (no en cadena): si no, una nota que cae en la fecha de otra pendiente se volvía a correr.
     let clases = b.clases;
-    pend.forEach((f, i) => { if (clases[f] && nuevas[i] && nuevas[i] !== f) {
+    if (pend.some(f => clases[f])) {
         const c = Object.assign({}, clases);
-        const v = c[f];
-        delete c[f];
-        c[nuevas[i]] = v;
+        const mov = pend.map(f => c[f]);
+        pend.forEach(f => { delete c[f]; });
+        mov.forEach((v, i) => { if (v && nuevas[i])
+            c[nuevas[i]] = v; });
         clases = c;
-    } });
+    }
     return Object.assign(Object.assign({}, out), { clases });
 }
 // adiestraFechas: fechas REALES de clase = base, sacando las omitidas y aplicando las
@@ -5968,6 +6198,10 @@ function avisosDeLaApp({ servicios, backup, shareMsg, primeros, nube, nubeCf, es
 // Solo lo que el paseador nota (nunca lo interno). La más nueva va PRIMERO. Una versión sin nada visible no se agrega.
 // En el celular se guarda la última vista (pc_novedades_visto, no viaja: cada aparato la ve una vez).
 const NOVEDADES = [
+    { ver: "2026-11-26c", fecha: "26/11/2026", items: [
+            "Eliminar un cliente ahora es más fácil: en Editar cliente, abajo, \"🗑️ Eliminar cliente\".",
+            "En la compu (pantalla grande), las secciones van al costado y se ve más ancho.",
+        ] },
     { ver: "2026-11-26b", fecha: "26/11/2026", items: [
             "Clases: al editar una serie ya empezada, \"Las que faltan arrancan el\" corre solo las clases que faltan. Las dictadas quedan como estaban.",
         ] },
@@ -12505,7 +12739,6 @@ function Agenda({ svc, avisosApp, avisosBase, pendientes, pide, setWaTpl, partes
     // Paseos individuales del día (ficha propia, como clase o estadía), por hora.
     const dayInd = useMemo(() => dayPs.filter(p => p.ind).sort((a, b) => String(a.ind.hora || "99").localeCompare(String(b.ind.hora || "99"))), [dayPs]);
     const dayAus = useMemo(() => paseos.filter(p => p.status === "ausente" && p.fecha === sel), [paseos, sel]);
-    const [grupoFiltro, setGrupoFiltro] = useState(null);
     // 25/11/2026 (Matías: "que solo aparezca lo que seleccionás", "que no muestre nada y seleccione el usuario"):
     // abajo del cuadro del día se ve SOLO lo que tocaste en él. La elección va atada a la fecha: al cambiar de día
     // no queda nada elegido. agSelK = la clave del renglón ("g:gid", "i:pid", "c:id", "e:id", "v") o null.
@@ -12521,8 +12754,8 @@ function Agenda({ svc, avisosApp, avisosBase, pendientes, pide, setWaTpl, partes
         const entries = Object.entries(m).sort(([a], [b]) => { if (a === SIN_REC)
             return -1; if (b === SIN_REC)
             return 1; const ga = gg.find(g => g.id === a), gb = gg.find(g => g.id === b); return ((ga === null || ga === void 0 ? void 0 : ga.startTime) || "zzz" + a).localeCompare((gb === null || gb === void 0 ? void 0 : gb.startTime) || "zzz" + b); });
-        return grupoFiltro ? entries.filter(([gid]) => gid === grupoFiltro) : entries;
-    }, [dayPs, gg, grupoFiltro]);
+        return entries;
+    }, [dayPs, gg]);
     const estList = useMemo(() => (guarderias || []).map(ensureEstadia), [guarderias]);
     const dayGuard = useMemo(() => estList.filter(g => g && g.desde <= sel && sel <= g.hasta).map((g, i) => ({ g, i, h: horaEstadiaDia(g, sel) })).sort((a, b) => (a.h ? 0 : 1) - (b.h ? 0 : 1) || a.h.localeCompare(b.h) || a.i - b.i).map(x => x.g), [estList, sel]);
     const hasEstadiaEn = fecha => estList.some(g => g && g.estado !== "cancelada" && g.desde <= fecha && fecha <= g.hasta);
@@ -12924,7 +13157,7 @@ function Agenda({ svc, avisosApp, avisosBase, pendientes, pide, setWaTpl, partes
             cxl && React.createElement("div", { style: { fontSize: 12, color: C.mut, marginTop: 6 } }, "Cancelado")));
     };
     // Recorridos y paseos individuales del día, por hora ("Sin recorrido" primero).
-    const bloquesDia = [...byGrp.map(e => ({ e, hora: e[0] === SIN_REC ? "" : ((gg.find(g => g.id === e[0]) || {}).startTime || "99") })), ...(grupoFiltro ? [] : dayInd.map(p => ({ ind: true, p, hora: (p.ind && p.ind.hora) || "99" })))]
+    const bloquesDia = [...byGrp.map(e => ({ e, hora: e[0] === SIN_REC ? "" : ((gg.find(g => g.id === e[0]) || {}).startTime || "99") })), ...dayInd.map(p => ({ ind: true, p, hora: (p.ind && p.ind.hora) || "99" }))]
         .sort((a, b) => (a.e && a.e[0] === SIN_REC ? -1 : b.e && b.e[0] === SIN_REC ? 1 : String(a.hora).localeCompare(String(b.hora))));
     return (React.createElement("div", null,
         arribaNuevo(),
@@ -12946,12 +13179,6 @@ function Agenda({ svc, avisosApp, avisosBase, pendientes, pide, setWaTpl, partes
                     React.createElement("div", { style: { display: "flex", gap: 8 } },
                         React.createElement("button", { id: "pc-sinconf-no", onClick: () => setSinConfOk(false), style: Object.assign(Object.assign({}, BR("secundario", false)), { flex: 1 }) }, "Volver"),
                         React.createElement("button", { id: "pc-sinconf-si", onClick: confirmarPasados, style: Object.assign(Object.assign({}, BR("primario", false)), { flex: 1 }) }, "Sí, confirmar")))),
-        grupoFiltro && agTab === "paseo" && (() => {
-            const gf = gg.find(g => g.id === grupoFiltro);
-            return (React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, background: C.grn + "14", border: `1px solid ${C.grn}44`, borderRadius: 10, padding: "7px 12px", marginBottom: 12 } },
-                React.createElement("span", { style: { fontSize: 12, color: C.grn, fontWeight: 700, flex: 1 } }, "Mostrando solo: " + ((gf === null || gf === void 0 ? void 0 : gf.name) || "recorrido")),
-                React.createElement("button", { onClick: () => setGrupoFiltro(null), style: { background: "transparent", border: "none", color: C.mut, fontSize: 12, fontWeight: 700, cursor: "pointer", textDecoration: "underline" } }, "Ver todos")));
-        })(),
         React.createElement("div", { id: "pc-ag-detalle", style: { scrollMarginTop: 8 } }),
         agTab === "ventas" && agSelK === "v" && (React.createElement("div", null,
             React.createElement(VentaForm, { key: sel, articulos: articulos, setArticulos: setArticulos, ventas: ventas, setVentas: setVentas, T: sel }),
@@ -16529,6 +16756,41 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
                     React.createElement("span", { style: { fontSize: 12, color: C.mut } }, hoy.length ? hoy.slice(0, 2).map(x => x.ic + " " + x.tit).join(" · ") : "nada para hoy")),
                 hoy.length > 0 && React.createElement("span", { className: "pc-wa-n", style: { background: C.amb, color: "#1a1200", borderRadius: 10, fontSize: 11, fontWeight: 800, padding: "2px 7px", flexShrink: 0 } }, hoy.length))))));
     }
+    // Cartel de borrar cliente: se usa desde la lista de archivados y desde Editar cliente (26/11/2026).
+    const dlgBorrarCli = confDelFis && (() => {
+        const c = clients.find(x => x.id === confDelFis);
+        if (!c)
+            return null;
+        const r = resumenBorrarCliente(paseos, dogs, c.id, td(), guarderias, adiestramiento);
+        const nom = c.name || "el cliente";
+        const pend = agendadoAlBorrar(c.id, dogs, guarderias, adiestramiento, td());
+        // 26/11/2026 (Matías: "me hicieron ver que para eliminar un cliente hay que dar muchos pasos y está difícil
+        // de encontrar"): ahora también se abre desde Editar cliente. Si el cliente está ACTIVO, "Sí, que quede" lo
+        // archiva (sale de la lista y guarda todo); si ya estaba archivado, solo cierra.
+        const activo = !c.archivado;
+        const cerrar = () => setConfDelFis(null);
+        const quedar = () => { if (activo) {
+            doArchiveCl(c.id);
+            if (editC && editC.id === c.id)
+                setEditC(null);
+        } setConfDelFis(null); };
+        const borrar = () => { doDelCl(c.id); if (editC && editC.id === c.id)
+            setEditC(null); setConfDelFis(null); };
+        return (React.createElement("div", { id: "pc-borrar-cliente", style: { position: "fixed", inset: 0, overflowY: "auto", background: "rgba(0,0,0,.8)", zIndex: 300, display: "flex", alignItems: "center", justifyContent: "center", padding: 24 } },
+            React.createElement("div", { style: { margin: "auto", background: C.card, borderRadius: 20, padding: 24, maxWidth: 360, width: "100%", border: `1px solid ${C.bdr}` } }, r.pierde ? React.createElement(React.Fragment, null,
+                React.createElement("div", { style: { fontWeight: 800, fontSize: 18, color: C.txt, marginBottom: 8 } }, "¿Querés que quede el historial de " + nom + "?"),
+                React.createElement("div", { id: "pc-borrar-cliente-pierde", style: { fontSize: 14, color: C.txt, lineHeight: 1.5 } }, textoBorrarPerro(r)),
+                React.createElement("button", { id: "pc-borrar-cliente-queda", onClick: quedar, style: Object.assign(Object.assign({}, BR("primario", false)), { width: "100%", marginTop: 16 }) }, activo ? "✅ Sí, archivarlo" : "✅ Sí, que quede"),
+                React.createElement("div", { style: { fontSize: 12.5, color: C.mut, lineHeight: 1.45, marginTop: 6 } }, activo ? "Sale de tu lista y queda en Archivados con todo: lo hecho, lo cobrado y lo que debe." : "Sigue en Archivados con todo: lo hecho, lo cobrado y lo que debe."),
+                React.createElement("button", { id: "pc-borrar-cliente-ok", onClick: borrar, style: Object.assign(Object.assign({}, Btn("#7f1d1d", C.txt)), { width: "100%", marginTop: 14 }) }, "🗑️ No, borrar todo"),
+                React.createElement("div", { style: { fontSize: 12.5, color: C.amb, fontWeight: 700, lineHeight: 1.45, marginTop: 6 } }, textoBorrarTodoCliente(r))) : React.createElement(React.Fragment, null,
+                React.createElement("div", { style: { fontWeight: 800, fontSize: 18, color: C.txt, marginBottom: 8 } }, "¿Borrar a " + nom + "?"),
+                React.createElement("div", { style: { fontSize: 14, color: C.mut, lineHeight: 1.5 } }, "No tiene paseos hechos ni cobros" + (pend ? "." : ": se borra sin perder nada, con " + (r.perros === 1 ? "su perro" : "sus perros") + ".")),
+                pend && React.createElement("div", { id: "pc-borrar-cliente-agendado", style: { fontSize: 13.5, color: C.amb, fontWeight: 700, lineHeight: 1.45, marginTop: 10 } }, pend),
+                React.createElement("div", { style: { display: "flex", gap: 10, marginTop: 12 } },
+                    React.createElement("button", { id: "pc-borrar-cliente-cancelar", onClick: cerrar, style: Object.assign(Object.assign({}, BR("secundario", false)), { flex: 1 }) }, "Cancelar"),
+                    React.createElement("button", { id: "pc-borrar-cliente-ok", onClick: borrar, style: Object.assign(Object.assign({}, Btn("#7f1d1d", C.txt)), { flex: 1 }) }, "Borrar"))))));
+    })();
     if (!sel)
         return (React.createElement("div", null,
             React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 } },
@@ -16638,30 +16900,7 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
                     }),
                     verArch && React.createElement("div", { style: { fontSize: 12, color: C.mut, padding: "8px 4px 0", lineHeight: 1.4 } }, "Los archivados conservan su historial en finanzas y estadísticas. 'Reactivar' los vuelve a la lista. La papelera los borra definitivamente (no se puede deshacer).")));
             })(),
-            confDelFis && (() => {
-                const c = clients.find(x => x.id === confDelFis);
-                if (!c)
-                    return null;
-                const r = resumenBorrarCliente(paseos, dogs, c.id, td(), guarderias, adiestramiento);
-                const nom = c.name || "el cliente";
-                const pend = agendadoAlBorrar(c.id, dogs, guarderias, adiestramiento, td());
-                const cerrar = () => setConfDelFis(null);
-                const borrar = () => { doDelCl(c.id); setConfDelFis(null); };
-                return (React.createElement("div", { id: "pc-borrar-cliente", style: { position: "fixed", inset: 0, overflowY: "auto", background: "rgba(0,0,0,.8)", zIndex: 300, display: "flex", alignItems: "center", justifyContent: "center", padding: 24 } },
-                    React.createElement("div", { style: { margin: "auto", background: C.card, borderRadius: 20, padding: 24, maxWidth: 360, width: "100%", border: `1px solid ${C.bdr}` } }, r.pierde ? React.createElement(React.Fragment, null,
-                        React.createElement("div", { style: { fontWeight: 800, fontSize: 18, color: C.txt, marginBottom: 8 } }, "¿Querés que quede el historial de " + nom + "?"),
-                        React.createElement("div", { id: "pc-borrar-cliente-pierde", style: { fontSize: 14, color: C.txt, lineHeight: 1.5 } }, textoBorrarPerro(r)),
-                        React.createElement("button", { id: "pc-borrar-cliente-queda", onClick: cerrar, style: Object.assign(Object.assign({}, BR("primario", false)), { width: "100%", marginTop: 16 }) }, "✅ Sí, que quede"),
-                        React.createElement("div", { style: { fontSize: 12.5, color: C.mut, lineHeight: 1.45, marginTop: 6 } }, "Sigue en Archivados con todo: lo hecho, lo cobrado y lo que debe."),
-                        React.createElement("button", { id: "pc-borrar-cliente-ok", onClick: borrar, style: Object.assign(Object.assign({}, Btn("#7f1d1d", C.txt)), { width: "100%", marginTop: 14 }) }, "🗑️ No, borrar todo"),
-                        React.createElement("div", { style: { fontSize: 12.5, color: C.amb, fontWeight: 700, lineHeight: 1.45, marginTop: 6 } }, textoBorrarTodoCliente(r))) : React.createElement(React.Fragment, null,
-                        React.createElement("div", { style: { fontWeight: 800, fontSize: 18, color: C.txt, marginBottom: 8 } }, "¿Borrar a " + nom + "?"),
-                        React.createElement("div", { style: { fontSize: 14, color: C.mut, lineHeight: 1.5 } }, "No tiene paseos hechos ni cobros" + (pend ? "." : ": se borra sin perder nada, con " + (r.perros === 1 ? "su perro" : "sus perros") + ".")),
-                        pend && React.createElement("div", { id: "pc-borrar-cliente-agendado", style: { fontSize: 13.5, color: C.amb, fontWeight: 700, lineHeight: 1.45, marginTop: 10 } }, pend),
-                        React.createElement("div", { style: { display: "flex", gap: 10, marginTop: 12 } },
-                            React.createElement("button", { id: "pc-borrar-cliente-cancelar", onClick: cerrar, style: Object.assign(Object.assign({}, BR("secundario", false)), { flex: 1 }) }, "Cancelar"),
-                            React.createElement("button", { id: "pc-borrar-cliente-ok", onClick: borrar, style: Object.assign(Object.assign({}, Btn("#7f1d1d", C.txt)), { flex: 1 }) }, "Borrar"))))));
-            })(),
+            dlgBorrarCli,
             modalGrupo && (React.createElement("div", { onClick: () => setModalGrupo(false), style: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "flex-end", zIndex: 150 } },
                 React.createElement("div", { onClick: e => e.stopPropagation(), style: { width: "100%", maxWidth: 430, margin: "0 auto", background: C.card, borderTopLeftRadius: 20, borderTopRightRadius: 20, border: `1px solid ${C.bdr}`, padding: 18, paddingBottom: 28, maxHeight: "70vh", overflowY: "auto", position: "relative" } },
                     React.createElement(XCerrar, { onClick: () => setModalGrupo(false) }),
@@ -17004,7 +17243,9 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
                     React.createElement("div", { style: { fontSize: 12, color: C.mut, marginTop: 4, lineHeight: 1.4 } }, "El día siguiente se archiva solo."),
                     React.createElement("button", { id: "pc-baja-deshacer", onClick: () => deshacerLaBaja(editC.id), style: { background: "transparent", border: "none", color: C.blu, fontSize: 13, fontWeight: 700, cursor: "pointer", padding: "6px 0 0" } }, "Deshacer (sigue con el servicio)"))) : (React.createElement("button", { id: "pc-baja-abrir", onClick: () => setBajaM({ cid: editC.id, ultimo: td(), elecciones: {} }), style: Object.assign(Object.assign({}, BR("secundario", false)), { width: "100%", fontSize: 13, marginBottom: 10 }) }, "👋 Deja el servicio")),
                 React.createElement("button", { onClick: () => setConfArch(true), style: Object.assign(Object.assign({}, Btn("#1a1505", "#fcd34d")), { width: "100%", fontSize: 13 }) }, "Archivar cliente"),
+                React.createElement("button", { id: "pc-eliminar-cliente", onClick: () => setConfDelFis(editC.id), style: { width: "100%", marginTop: 10, padding: "10px 12px", borderRadius: 10, border: `1px solid ${C.red}66`, background: "transparent", color: "#fca5a5", fontSize: 13, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" } }, "🗑️ Eliminar cliente"),
                 confArch && React.createElement(Confirm, { title: "¿Archivar a " + ((editC === null || editC === void 0 ? void 0 : editC.name) || "este cliente") + "?", aviso: avisoArchivar(editC && editC.id, dogs, guarderias, adiestramiento, td()) || undefined, sub: "Desaparece de tu lista pero conserva todo su historial. Sus paseos que vienen se borran. Queda al final de Clientes, en 'Archivados': ahí lo podés reactivar o, si querés, eliminarlo del todo.", onOk: () => { doArchiveCl(editC.id); setConfArch(false); setEditC(null); }, onCancel: () => setConfArch(false) })))),
+        dlgBorrarCli,
         bajaM && (() => {
             const cl = clients.find(c => c.id === bajaM.cid);
             const plan = bajaM.ultimo ? bajaPlan(bajaM.cid, dogs.map(migDog), paseos, bajaM.ultimo, bajaM.dogId, descCli(bajaM.cid)) : { grupos: [], cancelar: 0 };
@@ -19586,7 +19827,7 @@ function App() {
     }, [ghostCleanupVersion]);
     const nubeResetRef = useRef(null); // "Borrar todo" también sale de la nube: un celular en blanco no borra los datos del otro aparato
     const doReset = () => { if (nubeResetRef.current)
-        nubeResetRef.current(); storage.clear(); setDogs(INIT_DOGS); setClients(INIT_CL); setRoutes([]); setGlobalRoute({ origin: "", destination: "", minPorKm: 15 }); setGG(INIT_GG); setPaseos(initPaseos(INIT_DOGS)); setAjustes({}); setAjPeriodo({}); setEdgeMemory({}); setEdgeMemMigrated(false); setEdgeLocMigrated(false); setRouteLugIdMigrated(false); setRutaGrupoMigrated(false); setConfReset(false); setTab("agenda"); };
+        nubeResetRef.current(); storage.clear(); setGuarderias([]); setAdiestramiento([]); setArticulos([]); setVentas([]); setCongeladas({}); setPartes({}); setDogs(INIT_DOGS); setClients(INIT_CL); setRoutes([]); setGlobalRoute({ origin: "", destination: "", minPorKm: 15 }); setGG(INIT_GG); setPaseos(initPaseos(INIT_DOGS)); setAjustes({}); setAjPeriodo({}); setEdgeMemory({}); setEdgeMemMigrated(false); setEdgeLocMigrated(false); setRouteLugIdMigrated(false); setRutaGrupoMigrated(false); setConfReset(false); setTab("agenda"); };
     const [ultimoBackup, setUltimoBackup] = usePersist("pc_last_backup", "");
     const [backupPospuesto] = usePersist("pc_backup_snooze", ""); // "Más tarde" viejo: se respeta lo ya pospuesto; desde el 25/11 la ✕ lo manda al círculo
     const [shareMsg, setShareMsg] = useState(null);
@@ -20048,6 +20289,26 @@ function App() {
         { id: "cobros", label: "Cobros" },
         { id: "stats", label: "Stats" },
     ];
+    const [anchoV, setAnchoV] = useState(() => { try {
+        return window.innerWidth || 360;
+    }
+    catch (e) {
+        return 360;
+    } });
+    useEffect(() => { const f = () => { try {
+        setAnchoV(window.innerWidth || 360);
+    }
+    catch (e) { } }; try {
+        window.addEventListener("resize", f);
+    }
+    catch (e) { } return () => { try {
+        window.removeEventListener("resize", f);
+    }
+    catch (e) { } }; }, []);
+    const enPC = modoPantalla(anchoV / normScale(cfg && cfg.textScale)) === "pc";
+    const irTab = id => { setTab(id); if (id !== "cobros")
+        setClienteFoco(null); };
+    const [rescateVisto, setRescateVisto] = useState(() => PC_RESCATE.motivo === "vacio" ? false : true);
     if (migrationError)
         return (React.createElement("div", { style: { position: "fixed", inset: 0, background: "#0f1a14", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", zIndex: 9999, padding: 20 } },
             React.createElement("div", { style: { maxWidth: 400, background: "#1a0a00", border: `1px solid ${C.amb}`, borderRadius: 14, padding: 20 } },
@@ -20473,7 +20734,7 @@ function App() {
     // Contador anónimo: al abrir y cuando vuelve la señal; si falla, se reintenta la próxima vez.
     useEffect(() => {
         const intentar = () => {
-            const hoy = td();
+            const hoy = hoyUTC();
             let prot = "", onl = true;
             try {
                 prot = window.location.protocol;
@@ -20496,7 +20757,11 @@ function App() {
                 try {
                     const ps = storage.load("pc_paseos", []);
                     const nb = storage.load("pc_nube", null);
-                    uso = usoParaContar({ usado: storage.tamano(), limite: LIMITE_ESPACIO, paseos: Array.isArray(ps) ? ps.length : 0, nube: !!(nb && nb.ses), idb: ESPEJO.resumen() });
+                    uso = usoParaContar({ usado: storage.tamano(), limite: LIMITE_ESPACIO, paseos: Array.isArray(ps) ? ps.length : 0, nube: !!(nb && nb.ses), idb: PC_RESCATE.n ? ("resc:" + PC_RESCATE.n + (PC_RESCATE.motivo === "vacio" ? "v" : "")) : ESPEJO.resumen() });
+                    try {
+                        uso = Object.assign(Object.assign({}, uso), actividadParaContar({ onboardingDone: storage.load("pc_onboarding_done", false), clients: storage.load("pc_clients", []), dogs: storage.load("pc_dogs", []), paseos: Array.isArray(ps) ? ps : [], hoy: td() }));
+                    }
+                    catch (e) { }
                 }
                 catch (e) {
                     uso = undefined;
@@ -20669,7 +20934,15 @@ function App() {
             React.createElement("div", { style: { fontSize: 12, color: C.mut, marginTop: 8, lineHeight: 1.45 } }, "Sin contraseña: te llega un código por mail para entrar. Tus datos quedan en el servidor de PaseoCan, no se comparten con nadie y podés salir cuando quieras."))),
         nubeUI.msg && React.createElement("div", { id: "pc-nube-msg", style: { fontSize: 12.5, color: C.red || C.amb, marginTop: 8, fontWeight: 700 } }, nubeUI.msg)));
     return (React.createElement(SvcCtx.Provider, { value: svc },
-        React.createElement("div", { style: { fontFamily: "'Segoe UI',system-ui,sans-serif", background: C.bg, minHeight: "100vh", maxWidth: 480, margin: "0 auto", color: C.txt } },
+        React.createElement("div", { id: "pc-app", "data-modo": enPC ? "pc" : "cel", style: Object.assign({ fontFamily: "'Segoe UI',system-ui,sans-serif", background: C.bg, minHeight: "100vh", color: C.txt }, (enPC ? { maxWidth: 780, marginLeft: "max(236px, calc((100% - 780px) / 2 + 110px))", marginRight: "auto" } : { maxWidth: 480, margin: "0 auto" })) },
+            enPC && React.createElement("nav", { id: "pc-nav-lateral", "aria-label": "Secciones", style: { position: "fixed", left: 0, top: 0, bottom: 0, width: 216, background: C.card, borderRight: `1px solid ${C.bdr}`, padding: "22px 12px", boxSizing: "border-box", zIndex: 100, display: "flex", flexDirection: "column", gap: 6 } },
+                React.createElement("div", { style: { fontSize: 20, fontWeight: 900, color: C.grn, padding: "0 10px 18px" } }, "🐾 PaseoCan"),
+                NAV_TABS.map(t => {
+                    const on = tab === t.id;
+                    return (React.createElement("button", { key: t.id, className: "pc-nav-lat", "data-tab": t.id, "aria-current": on ? "page" : undefined, onClick: () => irTab(t.id), style: { display: "flex", alignItems: "center", gap: 12, padding: "11px 12px", borderRadius: 12, border: "none", background: on ? C.grn + "1f" : "transparent", cursor: "pointer", fontFamily: "inherit", textAlign: "left" } },
+                        React.createElement(Icon, { name: t.id, size: 22, color: on ? C.grn : "#6b7280" }),
+                        React.createElement("span", { style: { fontSize: 15, fontWeight: on ? 800 : 600, color: on ? C.grn : C.txt } }, t.label)));
+                })),
             origenViejo && !mudado && destinoVivo && React.createElement("div", { id: "pc-mudanza-cartel", style: { background: C.grn + "22", borderBottom: `1px solid ${C.grn}`, padding: "12px 16px" } },
                 React.createElement("div", { style: { fontWeight: 800, fontSize: 15 } }, "🏠 PaseoCan se muda a paseocan.com.ar"),
                 React.createElement("div", { style: { fontSize: 13, color: C.mut, margin: "4px 0 10px" } }, "Tocá el botón y tus datos se pasan solos. Tarda un segundo."),
@@ -20754,15 +21027,18 @@ function App() {
                         React.createElement(Icon, { name: s.icon, size: 20, color: "#86efac" })),
                     React.createElement("div", { style: { fontSize: hdrCompacto ? (s.l === "Te deben" ? 12 : 15) : (s.l === "Te deben" ? 13 : 18), fontWeight: 800, color: C.txt, lineHeight: 1.2, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, s.v),
                     React.createElement("div", { style: { fontSize: hdrCompacto ? 11 : 12, color: "#86efac", marginTop: hdrCompacto ? 0 : 2, fontWeight: 500, whiteSpace: "nowrap" } }, s.l)))))),
-            React.createElement("div", { style: { position: "fixed", bottom: 0, left: "50%", transform: "translateX(-50%)", width: "100%", maxWidth: 480, background: C.card, borderTop: `1px solid ${C.bdr}`, display: "flex", zIndex: 100, paddingBottom: "env(safe-area-inset-bottom,8px)" } }, NAV_TABS.map(t => {
+            !enPC && React.createElement("div", { style: { position: "fixed", bottom: 0, left: "50%", transform: "translateX(-50%)", width: "100%", maxWidth: 480, background: C.card, borderTop: `1px solid ${C.bdr}`, display: "flex", zIndex: 100, paddingBottom: "env(safe-area-inset-bottom,8px)" } }, NAV_TABS.map(t => {
                 const isActive = tab === t.id;
-                return (React.createElement("button", { key: t.id, onClick: () => { setTab(t.id); if (t.id !== "cobros")
-                        setClienteFoco(null); }, style: { flex: 1, padding: "8px 2px 6px", border: "none", background: "none", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 4 } },
+                return (React.createElement("button", { key: t.id, onClick: () => irTab(t.id), style: { flex: 1, padding: "8px 2px 6px", border: "none", background: "none", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 4 } },
                     React.createElement(Icon, { name: t.id, size: 22, color: isActive ? C.grn : "#6b7280" }),
                     React.createElement("span", { style: { fontSize: 12, fontWeight: isActive ? 800 : 500, color: isActive ? C.grn : "#6b7280" } }, t.label),
                     isActive && React.createElement("div", { style: { width: 4, height: 4, borderRadius: "50%", background: C.grn } })));
             })),
-            React.createElement("div", { style: { padding: 16, paddingBottom: 80 } },
+            React.createElement("div", { style: { padding: enPC ? "20px 24px" : 16, paddingBottom: enPC ? 40 : 80 } },
+                rescateVisto === false && React.createElement("div", { id: "pc-rescate", style: { background: C.grn + "1a", border: `1.5px solid ${C.grn}`, borderRadius: 12, padding: "12px 14px", marginBottom: 14 } },
+                    React.createElement("div", { style: { fontSize: 14, fontWeight: 800, color: C.grn, marginBottom: 4 } }, "♻️ Recuperamos tus datos"),
+                    React.createElement("div", { style: { fontSize: 12.5, color: C.txt, marginBottom: 10, lineHeight: 1.4 } }, "El lugar de siempre apareció vacío y los trajimos de la copia interna del celular. Revisá que esté todo y, por las dudas, guardá un backup."),
+                    React.createElement("button", { id: "pc-rescate-ok", onClick: () => setRescateVisto(true), style: Object.assign(Object.assign({}, Btn(C.grn, "#0f1a14")), { width: "100%" }) }, "Entendido")),
                 salud.fallos.length > 0 && (React.createElement("div", { style: { background: C.red + "1f", border: `1.5px solid ${C.red}`, borderRadius: 12, padding: "12px 14px", marginBottom: 14 } },
                     React.createElement("div", { style: { fontSize: 14, fontWeight: 800, color: "#fca5a5", marginBottom: 4 } }, "⚠️ No se pudieron guardar tus últimos cambios"),
                     React.createElement("div", { style: { fontSize: 12.5, color: C.txt, marginBottom: 10, lineHeight: 1.4 } }, "Si cerrás la app ahora, se pierden (" + salud.fallos.map(nombreDato).join(", ") + "). Lo más común es que el celular esté sin espacio: guardá un backup ya, liberá espacio y tocá Reintentar."),
@@ -20782,7 +21058,7 @@ function App() {
                     React.createElement("div", { style: { flex: 1, minWidth: 0, fontSize: 13, color: C.txt, lineHeight: 1.45 } }, guia.listo || guiaPaso(guia.k)),
                     React.createElement("button", { id: "pc-guia-cerrar", "aria-label": "Cerrar", onClick: () => setGuia(null), style: { background: "none", border: "none", color: C.mut, fontSize: 15, cursor: "pointer", padding: "0 2px", flexShrink: 0 } }, "✕"))),
                 tab === "agenda" && (() => {
-                    const nov = novedadesPendientes(novVisto, (clients || []).length > 0).slice(0, 4);
+                    const nov = novedadesPendientes(novVisto, (clients || []).length > 0).slice(0, 5);
                     if (!nov.length)
                         return null;
                     return (React.createElement("div", { id: "pc-novedades", style: { background: C.card, border: `1.5px solid ${C.blu}66`, borderRadius: 14, padding: "12px 12px 8px", marginBottom: 14 } },
@@ -20970,7 +21246,7 @@ function App() {
                             React.createElement("div", { style: { fontSize: 12, color: C.mut, marginTop: 6, textAlign: "center" } }, (TEXT_SCALES.find(x => x[0] === normScale(cfg.textScale)) || TEXT_SCALES[0])[1])))),
                     G("privacidad", "🔒", "Privacidad", cfg.contadorOff ? "No avisa que se usa" : "Avisa de forma anónima que se usa", React.createElement(React.Fragment, null,
                         React.createElement("div", { style: { padding: "10px 0" } },
-                            TIT("Contar que se usa la app", "Una vez por día manda un número al azar de este celular, para saber cuánta gente usa PaseoCan, junto con cuánto espacio ocupa la app (en %), más o menos cuántos paseos tenés (por ejemplo, entre 100 y 999) y si usás la nube. Además avisa una sola vez cuando llegás a un primer paso (primer cliente, primer perro, primer paseo, primer cobro). Sin nombre, mail, clientes ni plata."),
+                            TIT("Contar que se usa la app", "Una vez por día manda un número al azar de este celular, para saber cuánta gente usa PaseoCan, junto con cuánto espacio ocupa la app (en %), más o menos cuántos paseos tenés (por ejemplo, entre 100 y 999), si usás la nube, si terminaste la bienvenida y, siempre más o menos, cuántos clientes y perros tenés (por ejemplo, entre 5 y 9) y cuántos paseos completaste en la última semana (por ejemplo, entre 10 y 29). Además avisa una sola vez cuando llegás a un primer paso (primer cliente, primer perro, primer paseo, primer cobro). Sin nombres, mail, teléfonos, direcciones ni plata."),
                             React.createElement("div", { id: "pc-cfg-contador", style: { display: "flex", gap: 6, marginTop: 8 } },
                                 React.createElement("button", { "data-k": "si", onClick: () => setCfg(c => (Object.assign(Object.assign({}, c), { contadorOff: false }))), style: SEG(!cfg.contadorOff) }, "Sí"),
                                 React.createElement("button", { "data-k": "no", onClick: () => setCfg(c => (Object.assign(Object.assign({}, c), { contadorOff: true }))), style: SEG(!!cfg.contadorOff) }, "No"))))),
@@ -21827,7 +22103,23 @@ const PcRedSeguridad = (typeof React !== "undefined" && React && React.Component
     }
 } : null;
 const root = ReactDOM.createRoot(document.getElementById('root'));
-const pcArrancar = () => root.render(PcRedSeguridad ? React.createElement(PcRedSeguridad, null, React.createElement(App)) : React.createElement(App));
+const pcDibujar = () => root.render(PcRedSeguridad ? React.createElement(PcRedSeguridad, null, React.createElement(App)) : React.createElement(App));
+// Etapa 3 de IndexedDB: antes de dibujar, ver si la copia interna tiene algo más nuevo (o si localStorage quedó vacío).
+// Con tiempo límite: si IndexedDB no contesta, arranca igual como siempre.
+const pcArrancar = () => {
+    let listo = false;
+    const ir = () => { if (!listo) {
+        listo = true;
+        pcDibujar();
+    } };
+    setTimeout(ir, 4000);
+    rescatarDeEspejo({ fac: null, leerLS: () => storage.crudos(), escribirLS: (k, v) => storage.escribirCrudo(k, v) })
+        .then(r => { try {
+        PC_RESCATE.n = r.n;
+        PC_RESCATE.motivo = r.motivo;
+    }
+    catch (e) { } }).catch(() => { }).then(ir);
+};
 let pcHashInicio = "";
 try {
     pcHashInicio = (window.location && window.location.hash) || "";
