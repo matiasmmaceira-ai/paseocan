@@ -1161,6 +1161,11 @@ const normScale = v => { const n = Number(v); return TEXT_SCALES.some(s => s[0] 
 // costado y el contenido usa más ancho. En el celular no cambia nada.
 const PC_DESDE = 900;
 function modoPantalla(anchoCss) { return (Number(anchoCss) || 0) >= PC_DESDE ? "pc" : "cel"; }
+// Ancho del contenido en la compu: 780; las secciones con lista + detalle (partes 2 y 3: Clientes, Cobros, Agenda), 1120.
+// Parte 4: Stats > Resumen pone la semana y el mes uno al lado del otro; las otras secciones de Stats quedan a 780.
+function anchoPCSeccion(tab, sec) { if (tab === "clientes" || tab === "cobros" || tab === "agenda")
+    return 1120; if (tab === "stats" && !["plata", "negocio", "tendencias", "clientes", "perros", "rutas"].includes(sec))
+    return 1120; return 780; }
 // Items predefinidos de "qué pedir que traigan" en una estadía. La config guarda
 // las keys tildadas (traerPredef) + textos libres (traerOtros); la estadía hereda
 // una copia RESUELTA a labels (campo opcional `traer:[]`, default [] en lectura).
@@ -2507,7 +2512,7 @@ function nombreDato(k) { return NOMBRE_DATO[k] || k; }
 // HTML: la base solo deja hacer lo que permiten sus reglas (RLS). NUNCA poner acá la secret/service_role.
 const SUPA_URL = "https://zwuakvfsgesdeiioimcj.supabase.co";
 const SUPA_KEY = "sb_publishable_aIkR9AH_aUigZVcm_eNlKQ_1eMtomWx";
-const APP_VER = "2026-11-26c";
+const APP_VER = "2026-11-26d";
 // Contador anónimo (Matías: "¿vamos a saber cuánta gente la está usando?"): una vez por día que se abre
 // la app, manda un número al azar de este celular + la versión (desde el 21/11 también % de espacio, rango de
 // paseos y si usa la nube: ver usoParaContar). Sin nombre, mail ni datos de clientes o plata. La
@@ -6198,6 +6203,11 @@ function avisosDeLaApp({ servicios, backup, shareMsg, primeros, nube, nubeCf, es
 // Solo lo que el paseador nota (nunca lo interno). La más nueva va PRIMERO. Una versión sin nada visible no se agrega.
 // En el celular se guarda la última vista (pc_novedades_visto, no viaja: cada aparato la ve una vez).
 const NOVEDADES = [
+    { ver: "2026-11-26d", fecha: "26/11/2026", items: [
+            "En la compu, Clientes y Cobros muestran la lista y el cliente uno al lado del otro; la Agenda, el día y lo que tocás; y Stats, la semana y el mes juntos.",
+            "Un paseo individual cancelado ahora tiene \"Reactivar\" en su ficha, igual que los de recorrido.",
+            "Cuando un cliente deja el servicio, te pregunta qué hacés con lo que te debe y si se hicieron los paseos sin confirmar: los que no, se borran sin ir a Perdiste.",
+        ] },
     { ver: "2026-11-26c", fecha: "26/11/2026", items: [
             "Eliminar un cliente ahora es más fácil: en Editar cliente, abajo, \"🗑️ Eliminar cliente\".",
             "En la compu (pantalla grande), las secciones van al costado y se ve más ancho.",
@@ -9995,9 +10005,11 @@ function deshacerOtrosBaja(guarderias, adiestramiento, baja) {
 // deudaPerroBaja (BUG-098, 20/11/2026): lo que te queda debiendo el cliente por paseos de ESE perro
 // (lo mismo que suma su tarjeta de Cobros esta semana, solo con ese perro y sin ajustes del cliente).
 // Se calcula sobre el resultado de la baja: refleja lo que se eligió para el período. Pura.
+// Sin dogId (26/11/2026, Matías: "le puse que dejaba el servicio y solo me preguntó si el pensionado seguía, no si el
+// paseo lo cobraba"): lo que debe el CLIENTE por todos sus perros. Antes la pregunta salía solo en "Dejó de venir".
 function deudaPerroBaja({ clients, mDogs, paseos, cid, dogId, hoy, congeladas }) {
     const cl = (clients || []).find(c => c && c.id === cid);
-    const md = (mDogs || []).filter(d => d && d.id === dogId && d.cid === cid);
+    const md = (mDogs || []).filter(d => esDeBaja(d, cid, dogId));
     if (!cl || !md.length)
         return 0;
     const w = wkRange(hoy || td());
@@ -10029,6 +10041,13 @@ function perdonarDeudaPerro(paseos, dogId, ultimo, plan, hoy) {
     });
     return { paseos: out, cambios };
 }
+// perdonarDeudaBaja: perdonarDeudaPerro para los perros de la baja (uno con dogId; sin dogId, todos los del cliente). Pura.
+function perdonarDeudaBaja(paseos, mDogs, cid, dogId, ultimo, plan, hoy) {
+    let ps = paseos;
+    const cambios = [];
+    (mDogs || []).filter(d => esDeBaja(d, cid, dogId)).forEach(d => { const r = perdonarDeudaPerro(ps, d.id, ultimo, plan, hoy); ps = r.paseos; cambios.push(...r.cambios); });
+    return { paseos: ps, cambios };
+}
 function deshacerPerdon(paseos, cambios) {
     const m = {};
     (cambios || []).forEach(x => { m[x.id] = x; });
@@ -10038,7 +10057,71 @@ function deshacerPerdon(paseos, cambios) {
         return p; const { perdon } = p, r = __rest(p, ["perdon"]); return Object.assign(Object.assign({}, r), { paid: !!m[p.id].paid }); });
 }
 // deshacerBajaPaseos: si se devolvió plata, los cobros vuelven a como estaban. Pura.
-function deshacerBajaPaseos(paseos, baja) {
+// ¿SE HIZO? (26/11/2026, Matías: "me interesa eso de si se hace. Solo sería con los que no están confirmados como
+// hechos"): al dejar el servicio, los paseos SIN CONFIRMAR de días que ya pasaron y de hoy (hasta el último día) se
+// preguntan uno por uno: "Sí" = quedan (cuentan para cobrar, como siempre); "No" = se borran (no van a Perdiste,
+// como si no hubieran estado agendados). Antes había que cancelarlos y caían en "Perdiste por cancelaciones".
+// sinConfirmarBaja: los que se preguntan (programados, sin plata, de un perro de la baja). Pura.
+function sinConfirmarBaja(paseos, mDogs, cid, dogId, ultimo, hoy) {
+    if (!ultimo)
+        return [];
+    const H = hoy || td(), tope = ultimo < H ? ultimo : H;
+    const ids = new Set((mDogs || []).filter(d => esDeBaja(d, cid, dogId)).map(d => d.id));
+    return (paseos || []).filter(p => p && ids.has(p.dogId) && p.status === "programado" && !p.paid && !((Number(p.pa) || 0) > 0) && p.fecha <= tope)
+        .sort((a, b) => a.fecha.localeCompare(b.fecha) || String(a.dogId).localeCompare(String(b.dogId)));
+}
+// borrarSinHacer: saca los elegidos "No" (ids) y devuelve los borrados para poder deshacer. Pura.
+function borrarSinHacer(paseos, ids) {
+    const set = new Set(ids || []);
+    if (!set.size)
+        return { paseos, borrados: [] };
+    const borrados = [];
+    const out = (paseos || []).filter(p => { if (p && set.has(p.id) && p.status === "programado" && !((Number(p.pa) || 0) > 0)) {
+        borrados.push(p);
+        return false;
+    } return true; });
+    return { paseos: out, borrados };
+}
+// cerrarSinHacer: el de HOY que se borra no tiene que volver a nacer (la auto-extensión genera desde hoy hasta el
+// "hasta" del plan): ese plan cierra el día anterior. Los de días pasados no se regeneran. Deshacer la baja vuelve
+// el "hasta" de antes (aplicarBaja lo guardó en cambios). Pura.
+// confirmarHechos: "Sí, se hizo" de un día que ya pasó queda confirmado (completado: deja de figurar "sin
+// confirmar" en la Agenda; para la plata ya contaba como hecho, BUG-100). El de hoy ("Sí, se hace") no se toca. Pura.
+function confirmarHechos(paseos, ids, hoy) {
+    const H = hoy || td();
+    const set = new Set(ids || []);
+    const ok = [];
+    if (!set.size)
+        return { paseos, ids: ok };
+    const out = (paseos || []).map(p => { if (p && set.has(p.id) && p.status === "programado" && p.fecha < H) {
+        ok.push(p.id);
+        return Object.assign(Object.assign({}, p), { status: "completado" });
+    } return p; });
+    return { paseos: out, ids: ok };
+}
+function cerrarSinHacer(dogs, borrados, hoy) {
+    const H = hoy || td();
+    const hoyB = (borrados || []).filter(p => p && p.fecha >= H);
+    if (!hoyB.length)
+        return dogs;
+    return (dogs || []).map(d => {
+        const mios = hoyB.filter(p => d && p.dogId === d.id);
+        if (!mios.length)
+            return d;
+        return Object.assign(Object.assign({}, d), { groups: (d.groups || []).map(g => {
+                const x = mios.filter(p => p.dgid === g.id);
+                if (!g || !x.length)
+                    return g;
+                const f = x.map(p => p.fecha).sort()[0];
+                return (!g.hasta || g.hasta >= f) ? Object.assign(Object.assign({}, g), { hasta: addDays(f, -1) }) : g;
+            }) });
+    });
+}
+function deshacerBajaPaseos(paseos00, baja) {
+    const sh = (baja && baja.sinHacer) || [];
+    const hz = new Set((baja && baja.hechos) || []);
+    const paseos0 = hz.size ? (paseos00 || []).map(p => p && hz.has(p.id) && p.status === "completado" && !p.paid && !((Number(p.pa) || 0) > 0) ? Object.assign(Object.assign({}, p), { status: "programado" }) : p) : paseos00;
+    const paseos = sh.length ? [...(paseos0 || []), ...sh.filter(x => !(paseos0 || []).some(p => p && p.id === x.id))] : paseos0;
     const c = {};
     ((baja && baja.cambiosPa) || []).forEach(x => { c[x.id] = x.pa; });
     if (!Object.keys(c).length)
@@ -12588,7 +12671,7 @@ function juntarSalenJuntos(lista, mismo) {
     });
     return out;
 }
-function Agenda({ svc, avisosApp, avisosBase, pendientes, pide, setWaTpl, partes, setPartes, paseos, setPaseos, dogs, setDogs, clients, gg, setGG, setCfg, onAdd, onAddEstadia, onEditSerie, onGoCobros, mDogs, routes, setRoutes, edgeMemory, setEdgeMemory, globalRoute, waTpl, guarderias, setGuarderias, onGoFicha, cfg, onEstadiaConfirm, adiestramiento, setAdiestramiento, onAddClase, onEditClase, onRutaInforme, congeladas, ventas, setVentas, articulos, setArticulos }) {
+function Agenda({ svc, avisosApp, avisosBase, pendientes, pide, setWaTpl, partes, setPartes, paseos, setPaseos, dogs, setDogs, clients, gg, setGG, setCfg, onAdd, onAddEstadia, onEditSerie, onGoCobros, mDogs, routes, setRoutes, edgeMemory, setEdgeMemory, globalRoute, waTpl, guarderias, setGuarderias, onGoFicha, cfg, onEstadiaConfirm, adiestramiento, setAdiestramiento, onAddClase, onEditClase, onRutaInforme, congeladas, ventas, setVentas, articulos, setArticulos, enPC }) {
     // Minutos por km del paseador: UN solo dato, de la config. Ver BUG-016.
     const velMin = (cfg && cfg.minPorKm) || 15;
     // ┌── SUB-BLOQUE 1/4: hooks/cálculos (fechas, byGrp, próximo paseo/clase/
@@ -13107,7 +13190,7 @@ function Agenda({ svc, avisosApp, avisosBase, pendientes, pide, setWaTpl, partes
                             return React.createElement("div", { className: "pc-ag-remedios", style: { fontSize: 12, fontWeight: 700, marginTop: 2, color: rd.atrasadas ? C.red : (rd.proxima ? C.amb : C.grn) } }, rd.atrasadas ? ("💊 " + rd.atrasadas + (rd.atrasadas === 1 ? " remedio atrasado" : " remedios atrasados") + (rd.proxima ? " · próximo " + rd.proxima : "")) : (rd.proxima ? ("💊 próximo remedio " + rd.proxima) : "💊 remedios del día dados ✓"));
                         })(),
                         (choques[x.key] || []).length > 0 && React.createElement("div", { className: "pc-ag-choque", style: { fontSize: 12, color: C.amb, fontWeight: 700, marginTop: 2 } }, "⚠️ Se pisa con: " + choques[x.key].map(o => (o.hora ? o.hora + " " : "") + o.titulo).join(" y ")))) }), x.key === agSelK, x.tipo === "ausentes" ? null : () => irDetalle(TAB_DE[x.tipo], x.key), React.createElement("div", { style: { width: 44, fontWeight: 800, fontSize: 13, color: colTipo[x.tipo], flexShrink: 0 } }, x.hora || ""))),
-                itemsDia.some(x => x.tipo !== "ausentes") && !agSelK && React.createElement("div", { id: "pc-ag-elegi", style: { fontSize: 12, color: C.mut, padding: "6px 0 0" } }, "Tocá uno para ver su detalle abajo."),
+                itemsDia.some(x => x.tipo !== "ausentes") && !agSelK && React.createElement("div", { id: "pc-ag-elegi", style: { fontSize: 12, color: C.mut, padding: "6px 0 0" } }, enPC ? "Tocá uno para ver su detalle al costado." : "Tocá uno para ver su detalle abajo."),
                 itemsDia.length === 0 && proximos.length > 0 && (React.createElement("div", { style: { marginTop: 6, paddingTop: 8, borderTop: `1px solid ${C.bdr}` } },
                     React.createElement("div", { style: { fontSize: 12, color: C.grn, fontWeight: 800, marginBottom: 2 } }, "Lo próximo"),
                     proximos.map((x, i) => fila({ k: "p" + i, cuerpo: (React.createElement(React.Fragment, null,
@@ -13154,13 +13237,19 @@ function Agenda({ svc, avisosApp, avisosBase, pendientes, pide, setWaTpl, partes
             hecho && React.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 8 } },
                 React.createElement("span", { style: { fontSize: 13, fontWeight: 800, color: C.grn } }, "✓ Hecho"),
                 !((Number(p.pa) || 0) > 0) && React.createElement("button", { className: "pc-ind-deshacer", onClick: () => setPaseos(ps => ps.map(x => x.id === p.id && x.status === "completado" && !((Number(x.pa) || 0) > 0) ? Object.assign(Object.assign({}, x), { status: "programado" }) : x)), style: { background: "transparent", border: "none", color: C.mut, fontSize: 12, textDecoration: "underline", cursor: "pointer", fontFamily: "inherit" } }, "Deshacer")),
-            cxl && React.createElement("div", { style: { fontSize: 12, color: C.mut, marginTop: 6 } }, "Cancelado")));
+            cxl && React.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginTop: 8 } },
+                React.createElement("span", { style: { fontSize: 12, color: C.mut } }, "Cancelado" + (CXL_TXT[p.cancelBy] ? (" (" + CXL_TXT[p.cancelBy] + ")") : "")),
+                React.createElement("button", { className: "pc-ind-reactivar", onClick: () => { const av = reactivarAvisoAbono(p, mDogs); if (reactivarPregunta(p) || av)
+                        setReactPend({ p, dname: dog.name, abono: av });
+                    else
+                        doReactivar(p, false); }, style: Object.assign(Object.assign({}, BR("secundario", false)), { padding: "7px 14px", fontSize: 13 }) }, "Reactivar"))));
     };
     // Recorridos y paseos individuales del día, por hora ("Sin recorrido" primero).
     const bloquesDia = [...byGrp.map(e => ({ e, hora: e[0] === SIN_REC ? "" : ((gg.find(g => g.id === e[0]) || {}).startTime || "99") })), ...dayInd.map(p => ({ ind: true, p, hora: (p.ind && p.ind.hora) || "99" }))]
         .sort((a, b) => (a.e && a.e[0] === SIN_REC ? -1 : b.e && b.e[0] === SIN_REC ? 1 : String(a.hora).localeCompare(String(b.hora))));
-    return (React.createElement("div", null,
-        arribaNuevo(),
+    // Versión para PC, parte 3 (26/11/2026): en pantalla ancha, el día a la izquierda y el detalle de lo que tocás a la
+    // derecha (en el celular, el detalle va abajo, como siempre). Los carteles flotantes van igual en el resto.
+    const agResto = (React.createElement(React.Fragment, null,
         sinConfM && React.createElement(Modal, { onClose: () => { setSinConfM(false); setSinConfOk(false); }, title: "📋 Paseos sin confirmar" },
             React.createElement("div", { id: "pc-sinconf", style: { fontSize: 13, color: C.mut, lineHeight: 1.45, marginBottom: 10 } }, "Son de días que ya pasaron y siguen como \"por hacer\". Para la plata ya cuentan como hechos (Cobros y Stats los cobran). Si alguno no se hizo, entrá a ese día y cancelalo."),
             sinConf.slice(0, 14).map(d => {
@@ -14837,6 +14926,13 @@ function Agenda({ svc, avisosApp, avisosBase, pendientes, pide, setWaTpl, partes
                         React.createElement("button", { onClick: () => { doOmitirClase(a.id, claseOcc.fecha, "reprogramar"); setClaseOcc(null); }, style: { width: "100%", padding: 11, borderRadius: 10, border: `1px solid ${C.bdr}`, background: "transparent", color: C.txt, fontWeight: 700, fontSize: 13, cursor: "pointer", marginBottom: 8 } }, "Reprogramar (se corre al próximo día · mismo total)"),
                         React.createElement("button", { onClick: () => { doOmitirClase(a.id, claseOcc.fecha, "quitar"); setClaseOcc(null); }, style: { width: "100%", padding: 11, borderRadius: 10, border: `1px solid ${C.amb}66`, background: "transparent", color: C.amb, fontWeight: 700, fontSize: 13, cursor: "pointer" } }, "Quitar (una clase menos · baja el total)")))));
         })()));
+    return (React.createElement("div", null, enPC ? React.createElement("div", { id: "pc-dos-col", style: { display: "grid", gridTemplateColumns: "minmax(360px,460px) minmax(0,1fr)", gap: 20, alignItems: "start" } },
+        React.createElement("div", { id: "pc-col-lista", style: { minWidth: 0 } }, arribaNuevo()),
+        React.createElement("div", { id: "pc-col-detalle", style: { minWidth: 0 } },
+            !agSelK && React.createElement("div", { id: "pc-detalle-vacio", style: Object.assign(Object.assign({}, CARD), { textAlign: "center", color: C.mut, padding: "40px 20px", fontSize: 14 }) }, "Tocá un recorrido, una estadía o una clase para ver el detalle acá."),
+            agResto)) : React.createElement(React.Fragment, null,
+        arribaNuevo(),
+        agResto)));
 }
 /* └── FIN: screens/Agenda.jsx ───────────────────────────────────────────── */
 /* ┌─────────────────────────────────────────────────────────────────────────┐
@@ -15290,7 +15386,7 @@ function ClaseCobroCard({ a, dog, setAdiestramiento, T }) {
             React.createElement("button", { onClick: cobrar, style: Object.assign(Object.assign({}, BR("primario", false)), { width: "100%", padding: "13px", fontWeight: 800, fontSize: 15 }) }, "Cobrar " + $(monto)))),
         saldo > 0 && precio <= 0 && (React.createElement("div", { style: { marginTop: 10, fontSize: 12, color: C.mut } }, "Poné un precio por clase en la serie para cobrarla."))));
 }
-function Cobros({ svc, paseos, setPaseos, clients, clienteFoco, onVolverClientes, mDogs, guarderias, setGuarderias, adiestramiento, setAdiestramiento, onUse, ajustes, setAjustes, congeladas, ajPeriodo, setAjPeriodo, ventas }) {
+function Cobros({ svc, paseos, setPaseos, clients, clienteFoco, onVolverClientes, mDogs, guarderias, setGuarderias, adiestramiento, setAdiestramiento, onUse, ajustes, setAjustes, congeladas, ajPeriodo, setAjPeriodo, ventas, enPC }) {
     const T = td();
     const [confPay, setConfPay] = useState(null);
     const [claseCobro, setClaseCobro] = useState(null);
@@ -15488,9 +15584,12 @@ function Cobros({ svc, paseos, setPaseos, clients, clienteFoco, onVolverClientes
         setAjustes(a => (Object.assign(Object.assign({}, a), { [cid]: undefined })));
         setConfPay(null);
     };
-    return (React.createElement("div", null,
+    // Versión para PC, parte 2 (26/11/2026): en pantalla ancha, la lista de Cobros a la izquierda y la ficha del
+    // cliente a la derecha. En el celular, lo de siempre (lista O ficha).
+    const verLista = !expandido || enPC;
+    const cobCabeza = (React.createElement(React.Fragment, null,
         React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 } },
-            expandido ? React.createElement(VolverA, { id: "pc-cob-volver", grande: true, a: "Cobros", onClick: () => setExpandido(null) })
+            (expandido && !enPC) ? React.createElement(VolverA, { id: "pc-cob-volver", grande: true, a: "Cobros", onClick: () => setExpandido(null) })
                 : React.createElement("div", { style: { fontWeight: 800, fontSize: 18, color: C.txt } }, "Cobros"),
             clienteFoco && !expandido && onVolverClientes && React.createElement(VolverA, { a: "Clientes", onClick: onVolverClientes })),
         React.createElement("div", { style: { display: "flex", gap: 6, marginBottom: 10 } }, [{ k: "semana", l: "Semana" }, { k: "mes", l: "Mes" }].map(o => (React.createElement("button", { key: o.k, onClick: () => cambiarModo(o.k), style: { flex: 1, padding: "7px", borderRadius: 20, border: `1px solid ${C.bdr}`, background: modoPeriodo === o.k ? C.grn : "transparent", color: modoPeriodo === o.k ? "#0f1a14" : C.mut, fontSize: 12, fontWeight: 700 } }, o.l)))),
@@ -15504,13 +15603,14 @@ function Cobros({ svc, paseos, setPaseos, clients, clienteFoco, onVolverClientes
                     return mesesL[t.getMonth()] + " " + t.getFullYear();
                 return "Semana del " + f.getDate() + " al " + t.getDate() + " de " + mesesC[t.getMonth()];
             })()),
-            React.createElement("button", { onClick: () => navPeriodo(1), style: { background: "transparent", border: "none", color: C.mut, fontSize: 18, fontWeight: 800, padding: "0 8px" } }, "\u203a")),
-        !expandido && React.createElement("div", { style: { display: "grid", gridTemplateColumns: "minmax(0,1fr) minmax(0,1fr)", gap: 8, marginBottom: 12 } }, [{ k: "entro", l: modoPeriodo === "mes" ? "Cobrado este mes" : "Cobrado esta semana", v: totCob + estCobradoSemana + adiPeriodo.cobrado + ventasPer, bg: "#14532d", fg: C.grn, sub: modoPeriodo === "mes" ? "pagos recibidos este mes" : "pagos recibidos esta semana" }, { k: "resto", l: "Falta cobrar", v: totPend + estPendiente + adiPeriodo.pendiente, bg: "#451a03", fg: C.amb, sub: qtd.totalAntes > 0.5 ? ("+ " + $(qtd.totalAntes) + " de antes") : queIncluye(svc) }].map(s => (React.createElement("div", { key: s.l, id: "pc-tot-" + s.k, onClick: () => s.k === "entro" && s.v > 0 && setPanelAbierto(panelAbierto === s.k ? null : s.k), style: { background: s.bg, borderRadius: 14, padding: 14, border: `1px solid ${s.fg}${panelAbierto === s.k ? "" : "44"}`, cursor: (s.k === "entro" && s.v > 0) ? "pointer" : "default", position: "relative" } },
+            React.createElement("button", { onClick: () => navPeriodo(1), style: { background: "transparent", border: "none", color: C.mut, fontSize: 18, fontWeight: 800, padding: "0 8px" } }, "\u203a"))));
+    const cobResumen = (React.createElement(React.Fragment, null,
+        verLista && React.createElement("div", { style: { display: "grid", gridTemplateColumns: "minmax(0,1fr) minmax(0,1fr)", gap: 8, marginBottom: 12 } }, [{ k: "entro", l: modoPeriodo === "mes" ? "Cobrado este mes" : "Cobrado esta semana", v: totCob + estCobradoSemana + adiPeriodo.cobrado + ventasPer, bg: "#14532d", fg: C.grn, sub: modoPeriodo === "mes" ? "pagos recibidos este mes" : "pagos recibidos esta semana" }, { k: "resto", l: "Falta cobrar", v: totPend + estPendiente + adiPeriodo.pendiente, bg: "#451a03", fg: C.amb, sub: qtd.totalAntes > 0.5 ? ("+ " + $(qtd.totalAntes) + " de antes") : queIncluye(svc) }].map(s => (React.createElement("div", { key: s.l, id: "pc-tot-" + s.k, onClick: () => s.k === "entro" && s.v > 0 && setPanelAbierto(panelAbierto === s.k ? null : s.k), style: { background: s.bg, borderRadius: 14, padding: 14, border: `1px solid ${s.fg}${panelAbierto === s.k ? "" : "44"}`, cursor: (s.k === "entro" && s.v > 0) ? "pointer" : "default", position: "relative" } },
             React.createElement("div", { style: { fontSize: 12, color: s.fg, opacity: .8 } }, s.l),
             React.createElement("div", { style: { fontSize: 20, fontWeight: 800, color: s.fg, marginTop: 4 } }, $(s.v)),
             React.createElement("div", { style: { fontSize: 12, color: s.fg, opacity: .55, marginTop: 3, lineHeight: 1.2 } }, s.sub),
             s.k === "entro" && s.v > 0 && (React.createElement("div", { style: { fontSize: 12.5, color: s.fg, opacity: .7, marginTop: 5, fontWeight: 700 } }, panelAbierto === s.k ? "▲ ocultar quién pagó" : "▾ quién pagó")))))),
-        !expandido && panelAbierto === "entro" && (totCob + estCobradoSemana + adiPeriodo.cobrado + ventasPer) > 0 && (() => {
+        verLista && panelAbierto === "entro" && (totCob + estCobradoSemana + adiPeriodo.cobrado + ventasPer) > 0 && (() => {
             // LO QUE ENTRÓ este período, por cliente (paseos + estadías + clases).
             // Cada tipo se atribuye al cliente vía el perro (dogId → dog.cid), usando
             // las MISMAS funciones que la tarjeta (buildEstadiaPeriodo / buildAdiestraPeriodo
@@ -15599,7 +15699,7 @@ function Cobros({ svc, paseos, setPaseos, clients, clienteFoco, onVolverClientes
                         React.createElement("span", { style: { color: C.amb } }, $(totalRest))),
                     React.createElement("div", { style: { fontSize: 12, color: C.mut, opacity: .65, marginTop: 8, fontStyle: "italic", lineHeight: 1.5 } }, "Un abono adelantado con todos los paseos cancelados no aparece: es pérdida, no pendiente."))));
         })(),
-        !expandido && (() => {
+        verLista && (() => {
             const sr = senasRecibidas(guarderias, wk.from, wk.to);
             const sd = senasRecibidasDetalle(guarderias, wk.from, wk.to);
             return sr > 0 ? (React.createElement("div", { style: { background: C.cl, border: `1px dashed ${C.grn}66`, borderRadius: 12, padding: "8px 12px", marginBottom: 18 } },
@@ -15616,7 +15716,8 @@ function Cobros({ svc, paseos, setPaseos, clients, clienteFoco, onVolverClientes
                         React.createElement("span", { style: { color: C.grn, fontWeight: 700 } }, $(x.monto)));
                 }))))) : null;
         })(),
-        byClient.length === 0 && React.createElement(EmptyTip, { titulo: "Sin cobros pendientes", mensaje: "Cuando completes paseos, los cobros aparecen acá solos." }),
+        byClient.length === 0 && React.createElement(EmptyTip, { titulo: "Sin cobros pendientes", mensaje: "Cuando completes paseos, los cobros aparecen acá solos." })));
+    const cobFicha = (React.createElement(React.Fragment, null,
         expandido && byClient.find(x => x.cl.id === expandido) && React.createElement(CobrosFicha, { data: byClient.find(x => x.cl.id === expandido), paseos: paseos, wk: wk, adjTotal: adjTotalLocal, ajPeriodo: ajPeriodo, setAjPeriodo: setAjPeriodo, periodoLbl: modoPeriodo === "mes" ? "mes" : "semana", ajEsts: estadiasDeCliente(expandido), ajSeries: seriesDeClienteTodas(expandido), setGuarderias: setGuarderias, setAdiestramiento: setAdiestramiento, onVolver: () => setExpandido(null), onCobrar: onCobrarDispatch, estPend: deudaEstadiaCliente(expandido), estSenas: senasCliente(expandido), showHistorial: showHistorial, setShowHistorial: setShowHistorial, mDogs: mDogs }),
         expandido && !byClient.find(x => x.cl.id === expandido) && (() => {
             const cl = clients.find(c => c.id === expandido);
@@ -15697,77 +15798,88 @@ function Cobros({ svc, paseos, setPaseos, clients, clienteFoco, onVolverClientes
                 activas.length === 0 && React.createElement("div", { style: { fontSize: 12, color: C.mut, marginBottom: 8 } }, "Sin clases pendientes"),
                 cobradas.length > 0 && React.createElement("button", { onClick: () => setVerCobradas(v => !v), style: Object.assign(Object.assign({}, BR("secundario", false)), { width: "100%", fontSize: 12, fontWeight: 700, padding: "8px", border: `1px solid ${C.bdr}`, marginBottom: 8 }) }, verCobradas ? "Ocultar cobradas" : ("Ver cobradas (" + cobradas.length + ")")),
                 verCobradas && cobradas.map(row)));
-        })(),
-        !expandido && (() => {
-            // Lista única "Te deben" (26/10/2026, dibujo aprobado). Un renglón por cliente con todo:
-            // paseos, estadías y clases. Mismos números que Clientes (quienTeDebe).
-            const perTxt = modoPeriodo === "mes" ? "mes" : "semana";
-            const pasa = f => filtroC === "paseo" ? f.paseos > 0 : filtroC === "estadia" ? (f.estadias + f.estadiasAntes) > 0 : filtroC === "clases" ? (f.clases + f.clasesAntes) > 0 : true;
-            const filas = qtd.filas.filter(pasa);
-            const otros = Math.round((totPend + estPendiente + adiPeriodo.pendiente) - qtd.totalPeriodo);
-            const det = f => {
-                const x = [];
-                if (f.paseos > 0)
-                    x.push(f.anteriorPaseos > 0.5 ? (f.paseosPeriodo > 0 ? (perTxt + " " + $(f.paseosPeriodo) + " · antes " + $(f.anteriorPaseos)) : "de antes") : perTxt);
-                if (f.estadias > 0)
-                    x.push("estadía");
-                if (f.estadiasAntes > 0)
-                    x.push("estadía de antes " + $(f.estadiasAntes));
-                if (f.clases > 0)
-                    x.push(f.paseos > 0 || f.estadias > 0 ? ("clases " + $(f.clases)) : "clases");
-                if (f.clasesAntes > 0)
-                    x.push("clases de antes " + $(f.clasesAntes));
-                return x.join(" · ");
-            };
-            const ico = f => (f.paseos > 0 ? "🐾" : "") + ((f.estadias + f.estadiasAntes) > 0 ? "🏠" : "") + ((f.clases + f.clasesAntes) > 0 ? "🎓" : "");
-            // 28/10/2026 (Matías: "¿si le ponemos el logo arriba para que entren las 4 solapas?"): ícono
-            // arriba y nombre abajo, las 4 del mismo ancho en un solo renglón (como el ranking de Clientes).
-            const chip = (v, l) => (React.createElement("button", { key: v, className: "pc-cob-filtro", "data-v": v, onClick: () => setFiltroC(v), style: Object.assign(Object.assign({}, BR("selector", filtroC === v)), { flex: "1 1 0", minWidth: 56, padding: "7px 2px", fontSize: 12, fontWeight: filtroC === v ? 800 : 600, borderRadius: 12, border: `1px solid ${filtroC === v ? C.grn : C.bdr}` }) },
-                React.createElement(TabLabel, { l: l })));
-            const cobradasEst = (guarderias || []).map(ensureEstadia).filter(e => e.estado !== "cancelada" && estadiaEnPeriodo(e, wk.from, wk.to) && estadiaTotal(e) > 0 && estadiaSaldo(e) <= 0);
-            const md = f => f ? (Number(f.slice(8, 10)) + "/" + Number(f.slice(5, 7))) : "";
-            return (React.createElement("div", { id: "pc-te-deben" },
-                React.createElement("div", { id: "pc-cob-filtros", style: { display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 12 } },
-                    chip("todos", "💰 Todos"),
-                    chip("paseo", "🐾 Paseo"),
-                    (!svc || svc.est) && chip("estadia", "🏠 Estadía"),
-                    (!svc || svc.cla) && chip("clases", "🎓 Clases")),
-                React.createElement("div", { style: { fontSize: 12, fontWeight: 800, color: C.mut, letterSpacing: "0.05em", textTransform: "uppercase", margin: "4px 0 8px" } }, "Te deben · " + filas.length),
-                filas.length === 0 && React.createElement("div", { style: Object.assign(Object.assign({}, CARD), { textAlign: "center", color: C.grn, fontWeight: 800 }) }, filtroC === "todos" ? ("Nadie te debe esta " + perTxt + " ✓") : "Nada pendiente de esto ✓"),
-                filas.map(f => {
-                    const col = f.deudaVieja ? C.red : ((f.paseos + f.estadias + f.estadiasAntes) > 0 ? C.amb : "#60a5fa");
-                    return (React.createElement("div", { key: f.cid, className: "pc-debe-fila", onClick: () => setExpandido(f.cid), style: Object.assign(Object.assign({}, CARD), { cursor: "pointer", display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", marginBottom: 7 }) },
-                        React.createElement("div", { style: { flex: 1, minWidth: 0 } },
-                            React.createElement("div", { style: { fontWeight: 800, fontSize: 16, color: C.txt, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } },
-                                f.nombre,
-                                f.archivado && React.createElement("span", { style: { fontSize: 11, color: C.mut, fontWeight: 600 } }, "  archivado")),
-                            React.createElement("div", { style: { fontSize: 12.5, color: C.mut, marginTop: 2, lineHeight: 1.35 } }, ico(f) + " " + f.perros.join(", ") + " · " + det(f))),
-                        React.createElement("div", { style: { textAlign: "right", flexShrink: 0 } },
-                            React.createElement("div", { className: "pc-debe-monto", style: { fontWeight: 800, fontSize: 15, color: col } }, $(f.total)),
-                            f.paquete > f.clases + f.clasesAntes + 0.5 && (f.clases + f.clasesAntes) > 0 && React.createElement("div", { style: { fontSize: 11, color: C.mut, fontWeight: 600 } }, "paquete " + $(f.paquete)))));
-                }),
-                otros >= 1 && React.createElement("div", { style: Object.assign(Object.assign({}, CARD), { display: "flex", justifyContent: "space-between", padding: "10px 12px", color: C.mut, fontWeight: 700 }) },
-                    React.createElement("span", null, "Otros (perros sin cliente)"),
-                    React.createElement("span", null, $(otros))),
-                qtd.alDia.length > 0 && filtroC === "todos" && (React.createElement("div", { style: Object.assign(Object.assign({}, CARD), { padding: "12px" }) },
-                    React.createElement("div", { onClick: () => setVerAlDia(v => !v), style: { display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" } },
-                        React.createElement("div", null,
-                            React.createElement("div", { style: { color: C.grn, fontWeight: 800, fontSize: 14 } }, "✓ Al día · " + qtd.alDia.length),
-                            React.createElement("div", { style: { fontSize: 12, color: C.mut, marginTop: 2 } }, qtd.alDia.map(f => f.nombre).join(", "))),
-                        React.createElement("span", { style: { color: C.grn } }, verAlDia ? "▲" : "▼")),
-                    verAlDia && qtd.alDia.map(f => (React.createElement("div", { key: f.cid, onClick: () => setExpandido(f.cid), style: { display: "flex", justifyContent: "space-between", padding: "9px 0", borderTop: `1px solid ${C.bdr}`, marginTop: 8, cursor: "pointer" } },
-                        React.createElement("span", { style: { fontWeight: 700, color: C.txt } }, f.nombre),
-                        React.createElement("span", { style: { color: C.mut, fontSize: 13 } }, f.perros.join(", ") + "  ›")))))),
-                cobradasEst.length > 0 && (filtroC === "todos" || filtroC === "estadia") && (React.createElement("div", { style: Object.assign(Object.assign({}, CARD), { padding: "12px" }) },
-                    React.createElement("div", { onClick: () => setVerCobradas(v => !v), style: { display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" } },
-                        React.createElement("div", null,
-                            React.createElement("div", { style: { color: C.amb, fontWeight: 800, fontSize: 14 } }, "🏠 Estadías cobradas · " + cobradasEst.length),
-                            React.createElement("div", { style: { fontSize: 12, color: C.mut, marginTop: 2 } }, cobradasEst.map(e => { const d = mDogs.find(x => x.id === e.dogId); return (d ? d.name : "Perro") + " " + md(e.desde) + (e.hasta && e.hasta !== e.desde ? (" al " + md(e.hasta)) : ""); }).join(", "))),
-                        React.createElement("span", { style: { color: C.amb } }, verCobradas ? "▲" : "▼")),
-                    verCobradas && cobradasEst.map(e => { const d = mDogs.find(x => x.id === e.dogId) || {}; return (React.createElement("div", { key: e.id, onClick: () => d.cid && setExpandido(d.cid), style: { display: "flex", justifyContent: "space-between", padding: "9px 0", borderTop: `1px solid ${C.bdr}`, marginTop: 8, cursor: "pointer" } },
-                        React.createElement("span", { style: { fontWeight: 700, color: C.txt } }, (d.name || "Perro") + " · " + md(e.desde) + (e.hasta && e.hasta !== e.desde ? (" al " + md(e.hasta)) : "")),
-                        React.createElement("span", { style: { color: C.grn, fontWeight: 800, fontSize: 13 } }, "Cobrada ✓"))); })))));
-        })(),
+        })()));
+    const cobLista = (React.createElement(React.Fragment, null, verLista && (() => {
+        // Lista única "Te deben" (26/10/2026, dibujo aprobado). Un renglón por cliente con todo:
+        // paseos, estadías y clases. Mismos números que Clientes (quienTeDebe).
+        const perTxt = modoPeriodo === "mes" ? "mes" : "semana";
+        const pasa = f => filtroC === "paseo" ? f.paseos > 0 : filtroC === "estadia" ? (f.estadias + f.estadiasAntes) > 0 : filtroC === "clases" ? (f.clases + f.clasesAntes) > 0 : true;
+        const filas = qtd.filas.filter(pasa);
+        const otros = Math.round((totPend + estPendiente + adiPeriodo.pendiente) - qtd.totalPeriodo);
+        const det = f => {
+            const x = [];
+            if (f.paseos > 0)
+                x.push(f.anteriorPaseos > 0.5 ? (f.paseosPeriodo > 0 ? (perTxt + " " + $(f.paseosPeriodo) + " · antes " + $(f.anteriorPaseos)) : "de antes") : perTxt);
+            if (f.estadias > 0)
+                x.push("estadía");
+            if (f.estadiasAntes > 0)
+                x.push("estadía de antes " + $(f.estadiasAntes));
+            if (f.clases > 0)
+                x.push(f.paseos > 0 || f.estadias > 0 ? ("clases " + $(f.clases)) : "clases");
+            if (f.clasesAntes > 0)
+                x.push("clases de antes " + $(f.clasesAntes));
+            return x.join(" · ");
+        };
+        const ico = f => (f.paseos > 0 ? "🐾" : "") + ((f.estadias + f.estadiasAntes) > 0 ? "🏠" : "") + ((f.clases + f.clasesAntes) > 0 ? "🎓" : "");
+        // 28/10/2026 (Matías: "¿si le ponemos el logo arriba para que entren las 4 solapas?"): ícono
+        // arriba y nombre abajo, las 4 del mismo ancho en un solo renglón (como el ranking de Clientes).
+        const chip = (v, l) => (React.createElement("button", { key: v, className: "pc-cob-filtro", "data-v": v, onClick: () => setFiltroC(v), style: Object.assign(Object.assign({}, BR("selector", filtroC === v)), { flex: "1 1 0", minWidth: 56, padding: "7px 2px", fontSize: 12, fontWeight: filtroC === v ? 800 : 600, borderRadius: 12, border: `1px solid ${filtroC === v ? C.grn : C.bdr}` }) },
+            React.createElement(TabLabel, { l: l })));
+        const cobradasEst = (guarderias || []).map(ensureEstadia).filter(e => e.estado !== "cancelada" && estadiaEnPeriodo(e, wk.from, wk.to) && estadiaTotal(e) > 0 && estadiaSaldo(e) <= 0);
+        const md = f => f ? (Number(f.slice(8, 10)) + "/" + Number(f.slice(5, 7))) : "";
+        return (React.createElement("div", { id: "pc-te-deben" },
+            React.createElement("div", { id: "pc-cob-filtros", style: { display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 12 } },
+                chip("todos", "💰 Todos"),
+                chip("paseo", "🐾 Paseo"),
+                (!svc || svc.est) && chip("estadia", "🏠 Estadía"),
+                (!svc || svc.cla) && chip("clases", "🎓 Clases")),
+            React.createElement("div", { style: { fontSize: 12, fontWeight: 800, color: C.mut, letterSpacing: "0.05em", textTransform: "uppercase", margin: "4px 0 8px" } }, "Te deben · " + filas.length),
+            filas.length === 0 && React.createElement("div", { style: Object.assign(Object.assign({}, CARD), { textAlign: "center", color: C.grn, fontWeight: 800 }) }, filtroC === "todos" ? ("Nadie te debe esta " + perTxt + " ✓") : "Nada pendiente de esto ✓"),
+            filas.map(f => {
+                const col = f.deudaVieja ? C.red : ((f.paseos + f.estadias + f.estadiasAntes) > 0 ? C.amb : "#60a5fa");
+                return (React.createElement("div", { key: f.cid, className: "pc-debe-fila", "data-sel": enPC && expandido === f.cid ? "1" : undefined, onClick: () => setExpandido(f.cid), style: Object.assign(Object.assign(Object.assign(Object.assign({}, CARD), { cursor: "pointer", display: "flex", alignItems: "center", gap: 10, padding: "10px 12px" }), (enPC && expandido === f.cid ? { border: `1.5px solid ${C.grn}`, background: C.grn + "14" } : {})), { marginBottom: 7 }) },
+                    React.createElement("div", { style: { flex: 1, minWidth: 0 } },
+                        React.createElement("div", { style: { fontWeight: 800, fontSize: 16, color: C.txt, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } },
+                            f.nombre,
+                            f.archivado && React.createElement("span", { style: { fontSize: 11, color: C.mut, fontWeight: 600 } }, "  archivado")),
+                        React.createElement("div", { style: { fontSize: 12.5, color: C.mut, marginTop: 2, lineHeight: 1.35 } }, ico(f) + " " + f.perros.join(", ") + " · " + det(f))),
+                    React.createElement("div", { style: { textAlign: "right", flexShrink: 0 } },
+                        React.createElement("div", { className: "pc-debe-monto", style: { fontWeight: 800, fontSize: 15, color: col } }, $(f.total)),
+                        f.paquete > f.clases + f.clasesAntes + 0.5 && (f.clases + f.clasesAntes) > 0 && React.createElement("div", { style: { fontSize: 11, color: C.mut, fontWeight: 600 } }, "paquete " + $(f.paquete)))));
+            }),
+            otros >= 1 && React.createElement("div", { style: Object.assign(Object.assign({}, CARD), { display: "flex", justifyContent: "space-between", padding: "10px 12px", color: C.mut, fontWeight: 700 }) },
+                React.createElement("span", null, "Otros (perros sin cliente)"),
+                React.createElement("span", null, $(otros))),
+            qtd.alDia.length > 0 && filtroC === "todos" && (React.createElement("div", { style: Object.assign(Object.assign({}, CARD), { padding: "12px" }) },
+                React.createElement("div", { onClick: () => setVerAlDia(v => !v), style: { display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" } },
+                    React.createElement("div", null,
+                        React.createElement("div", { style: { color: C.grn, fontWeight: 800, fontSize: 14 } }, "✓ Al día · " + qtd.alDia.length),
+                        React.createElement("div", { style: { fontSize: 12, color: C.mut, marginTop: 2 } }, qtd.alDia.map(f => f.nombre).join(", "))),
+                    React.createElement("span", { style: { color: C.grn } }, verAlDia ? "▲" : "▼")),
+                verAlDia && qtd.alDia.map(f => (React.createElement("div", { key: f.cid, onClick: () => setExpandido(f.cid), style: { display: "flex", justifyContent: "space-between", padding: "9px 0", borderTop: `1px solid ${C.bdr}`, marginTop: 8, cursor: "pointer" } },
+                    React.createElement("span", { style: { fontWeight: 700, color: C.txt } }, f.nombre),
+                    React.createElement("span", { style: { color: C.mut, fontSize: 13 } }, f.perros.join(", ") + "  ›")))))),
+            cobradasEst.length > 0 && (filtroC === "todos" || filtroC === "estadia") && (React.createElement("div", { style: Object.assign(Object.assign({}, CARD), { padding: "12px" }) },
+                React.createElement("div", { onClick: () => setVerCobradas(v => !v), style: { display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" } },
+                    React.createElement("div", null,
+                        React.createElement("div", { style: { color: C.amb, fontWeight: 800, fontSize: 14 } }, "🏠 Estadías cobradas · " + cobradasEst.length),
+                        React.createElement("div", { style: { fontSize: 12, color: C.mut, marginTop: 2 } }, cobradasEst.map(e => { const d = mDogs.find(x => x.id === e.dogId); return (d ? d.name : "Perro") + " " + md(e.desde) + (e.hasta && e.hasta !== e.desde ? (" al " + md(e.hasta)) : ""); }).join(", "))),
+                    React.createElement("span", { style: { color: C.amb } }, verCobradas ? "▲" : "▼")),
+                verCobradas && cobradasEst.map(e => { const d = mDogs.find(x => x.id === e.dogId) || {}; return (React.createElement("div", { key: e.id, onClick: () => d.cid && setExpandido(d.cid), style: { display: "flex", justifyContent: "space-between", padding: "9px 0", borderTop: `1px solid ${C.bdr}`, marginTop: 8, cursor: "pointer" } },
+                    React.createElement("span", { style: { fontWeight: 700, color: C.txt } }, (d.name || "Perro") + " · " + md(e.desde) + (e.hasta && e.hasta !== e.desde ? (" al " + md(e.hasta)) : "")),
+                    React.createElement("span", { style: { color: C.grn, fontWeight: 800, fontSize: 13 } }, "Cobrada ✓"))); })))));
+    })()));
+    return (React.createElement("div", null,
+        enPC ? React.createElement("div", { id: "pc-dos-col", style: { display: "grid", gridTemplateColumns: "minmax(320px,420px) minmax(0,1fr)", gap: 20, alignItems: "start" } },
+            React.createElement("div", { id: "pc-col-lista", style: { position: "sticky", top: 12, maxHeight: "calc(100vh - 24px)", overflowY: "auto", paddingRight: 4 } },
+                cobCabeza,
+                cobResumen,
+                cobLista),
+            React.createElement("div", { id: "pc-col-detalle", style: { minWidth: 0 } }, expandido ? cobFicha : React.createElement("div", { id: "pc-detalle-vacio", style: Object.assign(Object.assign({}, CARD), { textAlign: "center", color: C.mut, padding: "40px 20px", fontSize: 14 }) }, "Elegí un cliente de la lista para ver qué te debe y cobrarle."))) : React.createElement(React.Fragment, null,
+            cobCabeza,
+            cobResumen,
+            cobFicha,
+            cobLista),
         cobroChooser && (() => {
             const { entries, info } = cobroChooser;
             const md = f => f ? (f.slice(8, 10) + "/" + f.slice(5, 7)) : "--";
@@ -16386,7 +16498,7 @@ function compararClientesAZ(a, b) {
         return -1;
     return na.localeCompare(nb, "es", { sensitivity: "base", numeric: true });
 }
-function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setWaTpl, partes, setPartes, dogs, setDogs, clients, setClients, paseos, setPaseos, gg, setGG, onAdd, onGoCobros, clienteInicial, onClienteInicialUsado, dogEditInicial, onDogEditConsumed, mDogs, routes, edgeMemory, waTpl, cfg, guarderias, adiestramiento, congeladas, onEditSerie, onEditClase, onEditEstadia, onAddEstadia, onAddClase, setCfg, ajustes, ajPeriodo }) {
+function Clientes({ enPC, svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setWaTpl, partes, setPartes, dogs, setDogs, clients, setClients, paseos, setPaseos, gg, setGG, onAdd, onGoCobros, clienteInicial, onClienteInicialUsado, dogEditInicial, onDogEditConsumed, mDogs, routes, edgeMemory, waTpl, cfg, guarderias, adiestramiento, congeladas, onEditSerie, onEditClase, onEditEstadia, onAddEstadia, onAddClase, setCfg, ajustes, ajPeriodo }) {
     const [sel, setSel] = useState(null);
     const [modoCli, setModoCli] = useState("lista");
     const [waCli, setWaCli] = useState(null);
@@ -16429,8 +16541,17 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
         const b = bajaM;
         if (!b || !b.ultimo)
             return;
-        const plan = bajaPlan(b.cid, dogs.map(migDog), paseos, b.ultimo, b.dogId, descCli(b.cid));
-        const r = aplicarBaja(dogs, paseos, b.cid, b.ultimo, eleccionesBaja(b.elecciones, b.montos, plan), plan, td(), b.plata || {}, b.dogId);
+        const sh = borrarSinHacer(paseos, Object.keys(b.sinHacer || {}).filter(k => b.sinHacer[k] === "no"));
+        const hz = confirmarHechos(sh.paseos, Object.keys(b.sinHacer || {}).filter(k => b.sinHacer[k] === "si"), td());
+        const paseos0 = hz.paseos;
+        const plan = bajaPlan(b.cid, dogs.map(migDog), paseos0, b.ultimo, b.dogId, descCli(b.cid));
+        const r = aplicarBaja(dogs, paseos0, b.cid, b.ultimo, eleccionesBaja(b.elecciones, b.montos, plan), plan, td(), b.plata || {}, b.dogId);
+        if (sh.borrados.length) {
+            r.baja.sinHacer = sh.borrados;
+            r.dogs = cerrarSinHacer(r.dogs, sh.borrados, td());
+        }
+        if (hz.ids.length)
+            r.baja.hechos = hz.ids;
         // Estadías y clases que tenía por delante (se cancelan o se dejan, según eligió en el cartel).
         const otros = otrosDeBaja(b.cid, dogs.map(migDog), guarderias, adiestramiento, b.ultimo, b.dogId);
         const hoy = td();
@@ -16440,13 +16561,13 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
             setGuarderias(gs => aplicarOtrosBaja(gs, [], otros.filter(o => o.tipo === "est"), b.otros || {}, hoy).guarderias);
         if (ro.antes.some(x => x.tipo === "cla") && setAdiestramiento)
             setAdiestramiento(as => aplicarOtrosBaja([], as, otros.filter(o => o.tipo === "cla"), b.otros || {}, hoy).adiestramiento);
+        let ps = r.paseos;
+        if (deuda === "perdono") {
+            const pd = perdonarDeudaBaja(ps, dogs, b.cid, b.dogId, b.ultimo, plan);
+            ps = pd.paseos;
+            r.baja.perdon = pd.cambios;
+        }
         if (b.dogId) {
-            let ps = r.paseos;
-            if (deuda === "perdono") {
-                const pd = perdonarDeudaPerro(ps, b.dogId, b.ultimo, plan);
-                ps = pd.paseos;
-                r.baja.perdon = pd.cambios;
-            }
             setDogs(r.dogs.map(d => d && d.id === b.dogId ? Object.assign(Object.assign({}, d), { baja: r.baja }) : d));
             setPaseos(ps);
             setBajaM(null);
@@ -16455,10 +16576,12 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
             return;
         }
         setDogs(r.dogs);
-        setPaseos(r.paseos);
+        setPaseos(ps);
         setClients(cs => cs.map(c => c.id === b.cid ? Object.assign(Object.assign({}, c), { baja: r.baja }) : c));
         setEditC(e => e && e.id === b.cid ? Object.assign(Object.assign({}, e), { baja: r.baja }) : e);
         setBajaM(null);
+        if (deuda === "pago" && onGoCobros)
+            onGoCobros(b.cid);
     };
     const deshacerBajaPerro = dogId => {
         const d = dogs.find(x => x && x.id === dogId);
@@ -16481,7 +16604,7 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
         if (!c || !c.baja)
             return;
         setDogs(ds => deshacerBaja(ds, c.baja));
-        setPaseos(ps => deshacerBajaPaseos(ps, c.baja));
+        setPaseos(ps => deshacerPerdon(deshacerBajaPaseos(ps, c.baja), c.baja.perdon));
         if ((c.baja.otrosAntes || []).length) {
             if (setGuarderias)
                 setGuarderias(gs => deshacerOtrosBaja(gs, [], c.baja).guarderias);
@@ -16791,153 +16914,160 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
                     React.createElement("button", { id: "pc-borrar-cliente-cancelar", onClick: cerrar, style: Object.assign(Object.assign({}, BR("secundario", false)), { flex: 1 }) }, "Cancelar"),
                     React.createElement("button", { id: "pc-borrar-cliente-ok", onClick: borrar, style: Object.assign(Object.assign({}, Btn("#7f1d1d", C.txt)), { flex: 1 }) }, "Borrar"))))));
     })();
-    if (!sel)
-        return (React.createElement("div", null,
-            React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 } },
-                React.createElement("div", { style: { fontWeight: 800, fontSize: 20, color: C.txt } },
-                    "Clientes",
-                    React.createElement("span", { style: { fontSize: 15, color: C.mut, fontWeight: 600, marginLeft: 6 } }, String(activosL.length))),
-                React.createElement("button", { onClick: onAdd, style: Object.assign(Object.assign({}, BR("primario", false)), { padding: "8px 16px", fontSize: 13 }) }, "+ Añadir")),
-            tabsModo,
-            React.createElement("div", { style: { display: "flex", alignItems: "center", background: C.cl, border: `1px solid ${C.bdr}`, borderRadius: 12, padding: "8px 12px", marginBottom: 10, gap: 8 } },
-                React.createElement("span", { style: { color: C.mut, fontSize: 16 } }, "🔍"),
-                React.createElement("input", { value: busqueda, onChange: e => setBusqueda(e.target.value), placeholder: "Buscar cliente o perro...", style: { background: "none", border: "none", outline: "none", color: C.txt, fontSize: 14, flex: 1, fontFamily: "inherit" } }),
-                busqueda && React.createElement("button", { onClick: () => setBusqueda(""), style: { background: "none", border: "none", color: C.mut, cursor: "pointer", fontSize: 16 } }, "×")),
-            (() => {
-                const grupoSel = filtro.startsWith("g:") ? gg.find(g => g.id === filtro.slice(2)) : null;
-                const contratoSel = filtro.startsWith("c:") ? filtro.slice(2) : null;
-                const contratoLbl = k => k === "fijo_mensual" ? "Tarifa fija mensual" : k === "fijo_semanal" ? "Tarifa fija semanal" : k === "por_paseo" ? "Por paseo" : k;
-                // 28/10/2026 (Matías: "en clientes también"): como en Cobros, ícono arriba y nombre abajo,
-                // todos del mismo ancho en un renglón. Lo que debe cada uno va en un globito arriba a la derecha.
-                const tabBtn = (active, label, onClick, badge) => (React.createElement("button", { className: "pc-cli-filtro", onClick: onClick, style: Object.assign(Object.assign({}, BR("selector", active)), { position: "relative", flex: "1 1 0", minWidth: 50, padding: "7px 2px", fontSize: 12, fontWeight: active ? 800 : 600, borderRadius: 12, border: `1px solid ${active ? C.grn : C.bdr}` }) },
-                    React.createElement(TabLabel, { l: label }),
-                    badge ? React.createElement("span", { className: "pc-cli-filtro-n", style: { position: "absolute", top: 3, right: 4, minWidth: 16, height: 16, borderRadius: 8, background: C.amb, color: "#1a1206", fontSize: 10, fontWeight: 800, lineHeight: "16px", padding: "0 4px", boxSizing: "border-box" } }, String(badge)) : null));
-                return (React.createElement(React.Fragment, null,
-                    (nDeben > 0 || svcVe(svc, "est") || svcVe(svc, "cla")) && React.createElement("div", { id: "pc-filtros-clientes", style: { display: "flex", flexWrap: "wrap", gap: 5, marginBottom: 14 } },
-                        tabBtn(filtro === "todos", "👥 Todos", () => setFiltro("todos")),
-                        nDeben > 0 && tabBtn(filtro === "deben", "💰 Deben", () => setFiltro("deben"), nDeben),
-                        (svcVe(svc, "est") || svcVe(svc, "cla")) && tabBtn(filtro === "paseo", "🐾 Paseo", () => setFiltro("paseo")),
-                        svcVe(svc, "est") && tabBtn(filtro === "estadia", "🏠 Estadía", () => setFiltro("estadia")),
-                        svcVe(svc, "cla") && tabBtn(filtro === "clases", "🎓 Clases", () => setFiltro("clases"))),
-                    (((gg || []).length > 1) || grupoSel || contratoSel) && (React.createElement("div", { id: "pc-filtros-clientes-2", style: { display: "flex", gap: 6, marginTop: -8, marginBottom: 14 } },
-                        ((gg || []).length > 1 || grupoSel) && React.createElement("button", { id: "pc-cli-grupo", onClick: () => setModalGrupo(true), style: Object.assign(Object.assign({}, BR("selector", !!grupoSel)), { padding: "7px 12px", fontSize: 12, fontWeight: !!grupoSel ? 800 : 600, borderRadius: 12, border: `1px solid ${!!grupoSel ? C.grn : C.bdr}`, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", flex: 1, textAlign: "left" }) }, "Recorrido: " + (grupoSel ? grupoSel.name : "todos") + " ▾"),
-                        contratoSel && React.createElement("button", { onClick: () => setModalContrato(true), style: Object.assign(Object.assign({}, BR("selector", true)), { padding: "7px 12px", fontSize: 12, fontWeight: true ? 800 : 600, borderRadius: 12, border: `1px solid ${true ? C.grn : C.bdr}`, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", flex: 1, textAlign: "left" }) }, contratoLbl(contratoSel) + " ▾"),
-                        (grupoSel || contratoSel) && React.createElement("button", { "aria-label": "Sacar filtro", onClick: () => setFiltro("todos"), style: Object.assign(Object.assign({}, BR("secundario", false)), { padding: "6px 12px", fontSize: 13, borderRadius: 12, flexShrink: 0, border: `1px solid ${C.bdr}` }) }, "×")))));
-            })(),
-            clients.filter(c => !c.archivado).length === 0 && React.createElement(EmptyTip, { titulo: "Agregá tu primer cliente", mensaje: "Tocá '+ Añadir' arriba a la derecha para empezar. Después podés cargar sus perros." }),
-            clients.filter(c => {
-                if (c.archivado)
+    const vistaLista = (React.createElement("div", null,
+        React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 } },
+            React.createElement("div", { style: { fontWeight: 800, fontSize: 20, color: C.txt } },
+                "Clientes",
+                React.createElement("span", { style: { fontSize: 15, color: C.mut, fontWeight: 600, marginLeft: 6 } }, String(activosL.length))),
+            React.createElement("button", { onClick: onAdd, style: Object.assign(Object.assign({}, BR("primario", false)), { padding: "8px 16px", fontSize: 13 }) }, "+ Añadir")),
+        tabsModo,
+        React.createElement("div", { style: { display: "flex", alignItems: "center", background: C.cl, border: `1px solid ${C.bdr}`, borderRadius: 12, padding: "8px 12px", marginBottom: 10, gap: 8 } },
+            React.createElement("span", { style: { color: C.mut, fontSize: 16 } }, "🔍"),
+            React.createElement("input", { value: busqueda, onChange: e => setBusqueda(e.target.value), placeholder: "Buscar cliente o perro...", style: { background: "none", border: "none", outline: "none", color: C.txt, fontSize: 14, flex: 1, fontFamily: "inherit" } }),
+            busqueda && React.createElement("button", { onClick: () => setBusqueda(""), style: { background: "none", border: "none", color: C.mut, cursor: "pointer", fontSize: 16 } }, "×")),
+        (() => {
+            const grupoSel = filtro.startsWith("g:") ? gg.find(g => g.id === filtro.slice(2)) : null;
+            const contratoSel = filtro.startsWith("c:") ? filtro.slice(2) : null;
+            const contratoLbl = k => k === "fijo_mensual" ? "Tarifa fija mensual" : k === "fijo_semanal" ? "Tarifa fija semanal" : k === "por_paseo" ? "Por paseo" : k;
+            // 28/10/2026 (Matías: "en clientes también"): como en Cobros, ícono arriba y nombre abajo,
+            // todos del mismo ancho en un renglón. Lo que debe cada uno va en un globito arriba a la derecha.
+            const tabBtn = (active, label, onClick, badge) => (React.createElement("button", { className: "pc-cli-filtro", onClick: onClick, style: Object.assign(Object.assign({}, BR("selector", active)), { position: "relative", flex: "1 1 0", minWidth: 50, padding: "7px 2px", fontSize: 12, fontWeight: active ? 800 : 600, borderRadius: 12, border: `1px solid ${active ? C.grn : C.bdr}` }) },
+                React.createElement(TabLabel, { l: label }),
+                badge ? React.createElement("span", { className: "pc-cli-filtro-n", style: { position: "absolute", top: 3, right: 4, minWidth: 16, height: 16, borderRadius: 8, background: C.amb, color: "#1a1206", fontSize: 10, fontWeight: 800, lineHeight: "16px", padding: "0 4px", boxSizing: "border-box" } }, String(badge)) : null));
+            return (React.createElement(React.Fragment, null,
+                (nDeben > 0 || svcVe(svc, "est") || svcVe(svc, "cla")) && React.createElement("div", { id: "pc-filtros-clientes", style: { display: "flex", flexWrap: "wrap", gap: 5, marginBottom: 14 } },
+                    tabBtn(filtro === "todos", "👥 Todos", () => setFiltro("todos")),
+                    nDeben > 0 && tabBtn(filtro === "deben", "💰 Deben", () => setFiltro("deben"), nDeben),
+                    (svcVe(svc, "est") || svcVe(svc, "cla")) && tabBtn(filtro === "paseo", "🐾 Paseo", () => setFiltro("paseo")),
+                    svcVe(svc, "est") && tabBtn(filtro === "estadia", "🏠 Estadía", () => setFiltro("estadia")),
+                    svcVe(svc, "cla") && tabBtn(filtro === "clases", "🎓 Clases", () => setFiltro("clases"))),
+                (((gg || []).length > 1) || grupoSel || contratoSel) && (React.createElement("div", { id: "pc-filtros-clientes-2", style: { display: "flex", gap: 6, marginTop: -8, marginBottom: 14 } },
+                    ((gg || []).length > 1 || grupoSel) && React.createElement("button", { id: "pc-cli-grupo", onClick: () => setModalGrupo(true), style: Object.assign(Object.assign({}, BR("selector", !!grupoSel)), { padding: "7px 12px", fontSize: 12, fontWeight: !!grupoSel ? 800 : 600, borderRadius: 12, border: `1px solid ${!!grupoSel ? C.grn : C.bdr}`, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", flex: 1, textAlign: "left" }) }, "Recorrido: " + (grupoSel ? grupoSel.name : "todos") + " ▾"),
+                    contratoSel && React.createElement("button", { onClick: () => setModalContrato(true), style: Object.assign(Object.assign({}, BR("selector", true)), { padding: "7px 12px", fontSize: 12, fontWeight: true ? 800 : 600, borderRadius: 12, border: `1px solid ${true ? C.grn : C.bdr}`, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", flex: 1, textAlign: "left" }) }, contratoLbl(contratoSel) + " ▾"),
+                    (grupoSel || contratoSel) && React.createElement("button", { "aria-label": "Sacar filtro", onClick: () => setFiltro("todos"), style: Object.assign(Object.assign({}, BR("secundario", false)), { padding: "6px 12px", fontSize: 13, borderRadius: 12, flexShrink: 0, border: `1px solid ${C.bdr}` }) }, "×")))));
+        })(),
+        clients.filter(c => !c.archivado).length === 0 && React.createElement(EmptyTip, { titulo: "Agregá tu primer cliente", mensaje: "Tocá '+ Añadir' arriba a la derecha para empezar. Después podés cargar sus perros." }),
+        clients.filter(c => {
+            if (c.archivado)
+                return false;
+            const cd = mDogs.filter(d => d.cid === c.id);
+            // Filtro búsqueda
+            if (busqueda) {
+                const q = busqueda.toLowerCase();
+                const matchC = c.name.toLowerCase().includes(q);
+                const matchD = cd.some(d => d.name.toLowerCase().includes(q));
+                if (!matchC && !matchD)
                     return false;
-                const cd = mDogs.filter(d => d.cid === c.id);
-                // Filtro búsqueda
-                if (busqueda) {
-                    const q = busqueda.toLowerCase();
-                    const matchC = c.name.toLowerCase().includes(q);
-                    const matchD = cd.some(d => d.name.toLowerCase().includes(q));
-                    if (!matchC && !matchD)
-                        return false;
-                }
-                // Filtros rápidos
-                if (filtro === "deben")
-                    return montoListaCliente(ecL[c.id]).monto > 0;
-                if (filtro === "paseo") {
-                    const dogIds = new Set(cd.map(d => d.id));
-                    const tieneGrupo = cd.some(d => (d.groups || []).some(g => (g.schedule || []).length > 0));
-                    const tienePaseo = paseos.some(p => p && dogIds.has(p.dogId) && p.status !== "cancelado");
-                    return tieneGrupo || tienePaseo;
-                }
-                if (filtro === "estadia") {
-                    const dogIds = new Set(cd.map(d => d.id));
-                    const tieneRecur = cd.some(d => d.guarderiaRecur && Array.isArray(d.guarderiaRecur.schedule) && d.guarderiaRecur.schedule.length > 0);
-                    const tieneEstadia = (guarderias || []).some(e => e && dogIds.has(e.dogId) && e.estado !== "cancelada");
-                    return tieneRecur || tieneEstadia;
-                }
-                if (filtro === "clases") {
-                    const dogIds = new Set(cd.map(d => d.id));
-                    const tieneClase = (adiestramiento || []).some(a => a && dogIds.has(a.dogId) && a.estado !== "cancelada");
-                    return tieneClase;
-                }
-                if (filtro && filtro.startsWith("g:")) {
-                    const gid = filtro.slice(2);
-                    return cd.some(d => gruposReales(d).some(grp => (grp.gid || grp.id) === gid || grp.gid === gid));
-                }
-                if (filtro && filtro.startsWith("c:")) {
-                    const k = filtro.slice(2);
-                    const pg = cd.flatMap(gruposReales).find(g => g.id);
-                    const bt = pg === null || pg === void 0 ? void 0 : pg.billingType;
-                    return bt === k;
-                }
-                return true;
-            }).sort(compararClientesAZ).map(c => {
-                const cd = mDogs.filter(d => d.cid === c.id);
-                const sv = serviciosCliente(cd, paseos, guarderias, adiestramiento, T);
-                const ml = montoListaCliente(ecL[c.id]);
-                const col = ml.tono === "deuda" ? C.red : ml.tono === "pend" ? C.amb : ml.tono === "clases" ? "#60a5fa" : C.grn;
-                return (React.createElement("div", { key: c.id, className: "pc-cliente-fila", onClick: () => setSel(c.id), style: Object.assign(Object.assign({}, CARD), { cursor: "pointer", display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", marginBottom: 7 }) },
-                    React.createElement("div", { style: { flex: 1, minWidth: 0 } },
-                        React.createElement("div", { style: { fontWeight: 800, fontSize: 16, color: C.txt, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, c.name),
-                        React.createElement("div", { style: { fontSize: 13, color: C.mut, marginTop: 2, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, (sv.iconos ? (sv.iconos + " ") : "") + (cd.map(d => d.name).join(", ") || "Sin perros"))),
-                    ml.tono && React.createElement("div", { className: "pc-cliente-monto", style: { fontSize: 14, fontWeight: 800, color: col, whiteSpace: "nowrap", flexShrink: 0 } }, ml.monto > 0 ? $(ml.monto) : "✓"),
-                    c.phone && React.createElement(WaBtn, { tit: "Abrir el chat", href: waLink(c.phone, fillTemplate(tplWa(waTpl, "cliente"), { cliente: c.name, perro: cd.map(d => d.name).join(", ") })) })));
-            }),
-            (() => {
-                const arch = clients.filter(c => c.archivado);
-                if (arch.length === 0)
-                    return null;
-                return (React.createElement("div", { style: { marginTop: 18 } },
-                    React.createElement("button", { onClick: () => setVerArch(v => !v), style: { width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center", background: "transparent", border: `1px dashed ${C.bdr}`, borderRadius: 12, padding: "10px 14px", cursor: "pointer", color: C.mut, fontSize: 13, fontWeight: 700, fontFamily: "inherit" } },
-                        React.createElement("span", null, "Archivados (" + arch.length + ")"),
-                        React.createElement("span", null, verArch ? "▾" : "▸")),
-                    verArch && arch.map(c => {
-                        const cd = mDogs.filter(d => d.cid === c.id);
-                        return (React.createElement("div", { key: c.id, style: Object.assign(Object.assign({}, CARD), { marginTop: 10, display: "flex", alignItems: "center", gap: 12, opacity: 0.75 }) },
-                            React.createElement("div", { style: { width: 40, height: 40, borderRadius: "50%", background: C.mut + "22", border: `2px solid ${C.bdr}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, fontWeight: 800, color: C.mut, flexShrink: 0 } }, c.name.charAt(0).toUpperCase()),
-                            React.createElement("div", { style: { flex: 1, minWidth: 0 } },
-                                React.createElement("div", { style: { fontWeight: 700, fontSize: 14, color: C.txt } }, c.name),
-                                React.createElement("div", { style: { fontSize: 12, color: C.mut, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, cd.map(d => d.name).join(", ") || "Sin perros")),
-                            React.createElement("button", { onClick: () => doReactivarCl(c.id), style: Object.assign(Object.assign({}, BR("primario", false)), { padding: "6px 12px", fontSize: 12, fontWeight: 800, borderRadius: 8 }) }, "Reactivar"),
-                            React.createElement("button", { onClick: () => setConfDelFis(c.id), style: Object.assign(Object.assign({}, BR("peligro", false)), { padding: "6px 10px", fontSize: 12, borderRadius: 8 }) }, "🗑")));
-                    }),
-                    verArch && React.createElement("div", { style: { fontSize: 12, color: C.mut, padding: "8px 4px 0", lineHeight: 1.4 } }, "Los archivados conservan su historial en finanzas y estadísticas. 'Reactivar' los vuelve a la lista. La papelera los borra definitivamente (no se puede deshacer).")));
-            })(),
-            dlgBorrarCli,
-            modalGrupo && (React.createElement("div", { onClick: () => setModalGrupo(false), style: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "flex-end", zIndex: 150 } },
-                React.createElement("div", { onClick: e => e.stopPropagation(), style: { width: "100%", maxWidth: 430, margin: "0 auto", background: C.card, borderTopLeftRadius: 20, borderTopRightRadius: 20, border: `1px solid ${C.bdr}`, padding: 18, paddingBottom: 28, maxHeight: "70vh", overflowY: "auto", position: "relative" } },
-                    React.createElement(XCerrar, { onClick: () => setModalGrupo(false) }),
-                    React.createElement("div", { style: { width: 38, height: 4, background: C.bdr, borderRadius: 4, margin: "0 auto 14px" } }),
-                    React.createElement("div", { style: { fontWeight: 800, fontSize: 16, color: C.txt, marginBottom: 4 } }, "Filtrar por recorrido"),
-                    React.createElement("div", { style: { fontSize: 12, color: C.mut, marginBottom: 14 } }, "Elegí un recorrido para ver solo esos clientes"),
-                    gg.map(g => {
-                        const s = filtro === "g:" + g.id;
-                        return (React.createElement("button", { key: g.id, onClick: () => { setFiltro("g:" + g.id); setModalGrupo(false); }, style: { width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center", background: s ? C.grn + "22" : C.cl, border: `1px solid ${s ? C.grn : C.bdr}`, borderRadius: 12, padding: "13px 14px", marginBottom: 8, cursor: "pointer", color: s ? C.grn : C.txt, fontSize: 14, fontWeight: 700, fontFamily: "inherit" } },
-                            React.createElement("span", null, g.name),
-                            s && React.createElement("span", { style: { color: C.grn, fontWeight: 800 } }, "✓")));
-                    }),
-                    gg.length === 0 && React.createElement("div", { style: { fontSize: 12, color: C.mut, textAlign: "center", padding: "10px 0" } }, "No tenés recorridos cargados"),
-                    React.createElement("button", { onClick: () => { setFiltro("todos"); setModalGrupo(false); }, style: Object.assign(Object.assign({}, BR("secundario", false)), { width: "100%", marginTop: 6, fontFamily: "inherit", border: `1px solid ${C.bdr}` }) }, "Ver todos")))),
-            modalContrato && (() => {
-                const opt = (key, lbl) => {
-                    const s = filtro === key;
-                    return (React.createElement("button", { key: key, onClick: () => { setFiltro(key); setModalContrato(false); }, style: { width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center", background: s ? C.grn + "22" : C.cl, border: `1px solid ${s ? C.grn : C.bdr}`, borderRadius: 12, padding: "13px 14px", marginBottom: 8, cursor: "pointer", color: s ? C.grn : C.txt, fontSize: 14, fontWeight: 700, fontFamily: "inherit" } },
-                        React.createElement("span", null, lbl),
+            }
+            // Filtros rápidos
+            if (filtro === "deben")
+                return montoListaCliente(ecL[c.id]).monto > 0;
+            if (filtro === "paseo") {
+                const dogIds = new Set(cd.map(d => d.id));
+                const tieneGrupo = cd.some(d => (d.groups || []).some(g => (g.schedule || []).length > 0));
+                const tienePaseo = paseos.some(p => p && dogIds.has(p.dogId) && p.status !== "cancelado");
+                return tieneGrupo || tienePaseo;
+            }
+            if (filtro === "estadia") {
+                const dogIds = new Set(cd.map(d => d.id));
+                const tieneRecur = cd.some(d => d.guarderiaRecur && Array.isArray(d.guarderiaRecur.schedule) && d.guarderiaRecur.schedule.length > 0);
+                const tieneEstadia = (guarderias || []).some(e => e && dogIds.has(e.dogId) && e.estado !== "cancelada");
+                return tieneRecur || tieneEstadia;
+            }
+            if (filtro === "clases") {
+                const dogIds = new Set(cd.map(d => d.id));
+                const tieneClase = (adiestramiento || []).some(a => a && dogIds.has(a.dogId) && a.estado !== "cancelada");
+                return tieneClase;
+            }
+            if (filtro && filtro.startsWith("g:")) {
+                const gid = filtro.slice(2);
+                return cd.some(d => gruposReales(d).some(grp => (grp.gid || grp.id) === gid || grp.gid === gid));
+            }
+            if (filtro && filtro.startsWith("c:")) {
+                const k = filtro.slice(2);
+                const pg = cd.flatMap(gruposReales).find(g => g.id);
+                const bt = pg === null || pg === void 0 ? void 0 : pg.billingType;
+                return bt === k;
+            }
+            return true;
+        }).sort(compararClientesAZ).map(c => {
+            const cd = mDogs.filter(d => d.cid === c.id);
+            const sv = serviciosCliente(cd, paseos, guarderias, adiestramiento, T);
+            const ml = montoListaCliente(ecL[c.id]);
+            const col = ml.tono === "deuda" ? C.red : ml.tono === "pend" ? C.amb : ml.tono === "clases" ? "#60a5fa" : C.grn;
+            return (React.createElement("div", { key: c.id, className: "pc-cliente-fila", "data-sel": enPC && sel === c.id ? "1" : undefined, onClick: () => setSel(c.id), style: Object.assign(Object.assign(Object.assign({}, CARD), { cursor: "pointer", display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", marginBottom: 7 }), (enPC && sel === c.id ? { border: `1.5px solid ${C.grn}`, background: C.grn + "14" } : {})) },
+                React.createElement("div", { style: { flex: 1, minWidth: 0 } },
+                    React.createElement("div", { style: { fontWeight: 800, fontSize: 16, color: C.txt, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, c.name),
+                    React.createElement("div", { style: { fontSize: 13, color: C.mut, marginTop: 2, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, (sv.iconos ? (sv.iconos + " ") : "") + (cd.map(d => d.name).join(", ") || "Sin perros"))),
+                ml.tono && React.createElement("div", { className: "pc-cliente-monto", style: { fontSize: 14, fontWeight: 800, color: col, whiteSpace: "nowrap", flexShrink: 0 } }, ml.monto > 0 ? $(ml.monto) : "✓"),
+                c.phone && React.createElement(WaBtn, { tit: "Abrir el chat", href: waLink(c.phone, fillTemplate(tplWa(waTpl, "cliente"), { cliente: c.name, perro: cd.map(d => d.name).join(", ") })) })));
+        }),
+        (() => {
+            const arch = clients.filter(c => c.archivado);
+            if (arch.length === 0)
+                return null;
+            return (React.createElement("div", { style: { marginTop: 18 } },
+                React.createElement("button", { onClick: () => setVerArch(v => !v), style: { width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center", background: "transparent", border: `1px dashed ${C.bdr}`, borderRadius: 12, padding: "10px 14px", cursor: "pointer", color: C.mut, fontSize: 13, fontWeight: 700, fontFamily: "inherit" } },
+                    React.createElement("span", null, "Archivados (" + arch.length + ")"),
+                    React.createElement("span", null, verArch ? "▾" : "▸")),
+                verArch && arch.map(c => {
+                    const cd = mDogs.filter(d => d.cid === c.id);
+                    return (React.createElement("div", { key: c.id, style: Object.assign(Object.assign({}, CARD), { marginTop: 10, display: "flex", alignItems: "center", gap: 12, opacity: 0.75 }) },
+                        React.createElement("div", { style: { width: 40, height: 40, borderRadius: "50%", background: C.mut + "22", border: `2px solid ${C.bdr}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, fontWeight: 800, color: C.mut, flexShrink: 0 } }, c.name.charAt(0).toUpperCase()),
+                        React.createElement("div", { style: { flex: 1, minWidth: 0 } },
+                            React.createElement("div", { style: { fontWeight: 700, fontSize: 14, color: C.txt } }, c.name),
+                            React.createElement("div", { style: { fontSize: 12, color: C.mut, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, cd.map(d => d.name).join(", ") || "Sin perros")),
+                        React.createElement("button", { onClick: () => doReactivarCl(c.id), style: Object.assign(Object.assign({}, BR("primario", false)), { padding: "6px 12px", fontSize: 12, fontWeight: 800, borderRadius: 8 }) }, "Reactivar"),
+                        React.createElement("button", { onClick: () => setConfDelFis(c.id), style: Object.assign(Object.assign({}, BR("peligro", false)), { padding: "6px 10px", fontSize: 12, borderRadius: 8 }) }, "🗑")));
+                }),
+                verArch && React.createElement("div", { style: { fontSize: 12, color: C.mut, padding: "8px 4px 0", lineHeight: 1.4 } }, "Los archivados conservan su historial en finanzas y estadísticas. 'Reactivar' los vuelve a la lista. La papelera los borra definitivamente (no se puede deshacer).")));
+        })(),
+        !enPC && dlgBorrarCli,
+        modalGrupo && (React.createElement("div", { onClick: () => setModalGrupo(false), style: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "flex-end", zIndex: 150 } },
+            React.createElement("div", { onClick: e => e.stopPropagation(), style: { width: "100%", maxWidth: 430, margin: "0 auto", background: C.card, borderTopLeftRadius: 20, borderTopRightRadius: 20, border: `1px solid ${C.bdr}`, padding: 18, paddingBottom: 28, maxHeight: "70vh", overflowY: "auto", position: "relative" } },
+                React.createElement(XCerrar, { onClick: () => setModalGrupo(false) }),
+                React.createElement("div", { style: { width: 38, height: 4, background: C.bdr, borderRadius: 4, margin: "0 auto 14px" } }),
+                React.createElement("div", { style: { fontWeight: 800, fontSize: 16, color: C.txt, marginBottom: 4 } }, "Filtrar por recorrido"),
+                React.createElement("div", { style: { fontSize: 12, color: C.mut, marginBottom: 14 } }, "Elegí un recorrido para ver solo esos clientes"),
+                gg.map(g => {
+                    const s = filtro === "g:" + g.id;
+                    return (React.createElement("button", { key: g.id, onClick: () => { setFiltro("g:" + g.id); setModalGrupo(false); }, style: { width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center", background: s ? C.grn + "22" : C.cl, border: `1px solid ${s ? C.grn : C.bdr}`, borderRadius: 12, padding: "13px 14px", marginBottom: 8, cursor: "pointer", color: s ? C.grn : C.txt, fontSize: 14, fontWeight: 700, fontFamily: "inherit" } },
+                        React.createElement("span", null, g.name),
                         s && React.createElement("span", { style: { color: C.grn, fontWeight: 800 } }, "✓")));
-                };
-                return (React.createElement("div", { onClick: () => setModalContrato(false), style: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "flex-end", zIndex: 150 } },
-                    React.createElement("div", { onClick: e => e.stopPropagation(), style: { width: "100%", maxWidth: 430, margin: "0 auto", background: C.card, borderTopLeftRadius: 20, borderTopRightRadius: 20, border: `1px solid ${C.bdr}`, padding: 18, paddingBottom: 28, maxHeight: "70vh", overflowY: "auto", position: "relative" } },
-                        React.createElement(XCerrar, { onClick: () => setModalContrato(false) }),
-                        React.createElement("div", { style: { width: 38, height: 4, background: C.bdr, borderRadius: 4, margin: "0 auto 14px" } }),
-                        React.createElement("div", { style: { fontWeight: 800, fontSize: 16, color: C.txt, marginBottom: 4 } }, "Filtrar por contrato"),
-                        React.createElement("div", { style: { fontSize: 12, color: C.mut, marginBottom: 14 } }, "Elegí el tipo de facturación"),
-                        opt("c:fijo_semanal", "Tarifa fija semanal"),
-                        opt("c:fijo_mensual", "Tarifa fija mensual"),
-                        opt("c:por_paseo", "Por paseo"),
-                        React.createElement("button", { onClick: () => { setFiltro("todos"); setModalContrato(false); }, style: Object.assign(Object.assign({}, BR("secundario", false)), { width: "100%", marginTop: 6, fontFamily: "inherit", border: `1px solid ${C.bdr}` }) }, "Ver todos"))));
-            })()));
+                }),
+                gg.length === 0 && React.createElement("div", { style: { fontSize: 12, color: C.mut, textAlign: "center", padding: "10px 0" } }, "No tenés recorridos cargados"),
+                React.createElement("button", { onClick: () => { setFiltro("todos"); setModalGrupo(false); }, style: Object.assign(Object.assign({}, BR("secundario", false)), { width: "100%", marginTop: 6, fontFamily: "inherit", border: `1px solid ${C.bdr}` }) }, "Ver todos")))),
+        modalContrato && (() => {
+            const opt = (key, lbl) => {
+                const s = filtro === key;
+                return (React.createElement("button", { key: key, onClick: () => { setFiltro(key); setModalContrato(false); }, style: { width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center", background: s ? C.grn + "22" : C.cl, border: `1px solid ${s ? C.grn : C.bdr}`, borderRadius: 12, padding: "13px 14px", marginBottom: 8, cursor: "pointer", color: s ? C.grn : C.txt, fontSize: 14, fontWeight: 700, fontFamily: "inherit" } },
+                    React.createElement("span", null, lbl),
+                    s && React.createElement("span", { style: { color: C.grn, fontWeight: 800 } }, "✓")));
+            };
+            return (React.createElement("div", { onClick: () => setModalContrato(false), style: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "flex-end", zIndex: 150 } },
+                React.createElement("div", { onClick: e => e.stopPropagation(), style: { width: "100%", maxWidth: 430, margin: "0 auto", background: C.card, borderTopLeftRadius: 20, borderTopRightRadius: 20, border: `1px solid ${C.bdr}`, padding: 18, paddingBottom: 28, maxHeight: "70vh", overflowY: "auto", position: "relative" } },
+                    React.createElement(XCerrar, { onClick: () => setModalContrato(false) }),
+                    React.createElement("div", { style: { width: 38, height: 4, background: C.bdr, borderRadius: 4, margin: "0 auto 14px" } }),
+                    React.createElement("div", { style: { fontWeight: 800, fontSize: 16, color: C.txt, marginBottom: 4 } }, "Filtrar por contrato"),
+                    React.createElement("div", { style: { fontSize: 12, color: C.mut, marginBottom: 14 } }, "Elegí el tipo de facturación"),
+                    opt("c:fijo_semanal", "Tarifa fija semanal"),
+                    opt("c:fijo_mensual", "Tarifa fija mensual"),
+                    opt("c:por_paseo", "Por paseo"),
+                    React.createElement("button", { onClick: () => { setFiltro("todos"); setModalContrato(false); }, style: Object.assign(Object.assign({}, BR("secundario", false)), { width: "100%", marginTop: 6, fontFamily: "inherit", border: `1px solid ${C.bdr}` }) }, "Ver todos"))));
+        })()));
+    // Versión para PC, parte 2 (26/11/2026): en pantalla ancha, la lista queda a la izquierda y el cliente a la derecha.
+    // El cartel de borrar va AFUERA de las columnas: la lista es "sticky" y lo dejaría debajo del Editar cliente.
+    const enDosCol = (lista, detalle) => (React.createElement("div", { id: "pc-dos-col", style: { display: "grid", gridTemplateColumns: "minmax(300px,380px) minmax(0,1fr)", gap: 20, alignItems: "start" } },
+        React.createElement("div", { id: "pc-col-lista", style: { position: "sticky", top: 12, maxHeight: "calc(100vh - 24px)", overflowY: "auto", paddingRight: 4 } }, lista),
+        React.createElement("div", { id: "pc-col-detalle", style: { minWidth: 0 } }, detalle),
+        dlgBorrarCli));
+    if (!sel)
+        return enPC ? enDosCol(vistaLista, React.createElement("div", { id: "pc-detalle-vacio", style: Object.assign(Object.assign({}, CARD), { textAlign: "center", color: C.mut, padding: "40px 20px", fontSize: 14 }) }, "Elegí un cliente de la lista para ver su ficha.")) : vistaLista;
     const c = clients.find(x => x.id === sel);
     const cd = mDogs.filter(d => d.cid === sel);
     const cxls = cd.flatMap(d => (d.cancellations || []).map((x, ci) => (Object.assign(Object.assign({}, x), { dname: d.name, did: d.id, ci })))).sort((a, b) => (b.fecha || "").localeCompare(a.fecha || ""));
-    return (React.createElement("div", null,
-        React.createElement("div", { style: { marginBottom: 10 } },
+    const vistaDetalle = (React.createElement("div", null,
+        !enPC && React.createElement("div", { style: { marginBottom: 10 } },
             React.createElement(VolverA, { id: "pc-ficha-volver", grande: true, a: "Clientes", onClick: () => setSel(null) })),
         React.createElement("div", { style: CARD },
             React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, marginBottom: 10 } },
@@ -17245,10 +17375,14 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
                 React.createElement("button", { onClick: () => setConfArch(true), style: Object.assign(Object.assign({}, Btn("#1a1505", "#fcd34d")), { width: "100%", fontSize: 13 }) }, "Archivar cliente"),
                 React.createElement("button", { id: "pc-eliminar-cliente", onClick: () => setConfDelFis(editC.id), style: { width: "100%", marginTop: 10, padding: "10px 12px", borderRadius: 10, border: `1px solid ${C.red}66`, background: "transparent", color: "#fca5a5", fontSize: 13, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" } }, "🗑️ Eliminar cliente"),
                 confArch && React.createElement(Confirm, { title: "¿Archivar a " + ((editC === null || editC === void 0 ? void 0 : editC.name) || "este cliente") + "?", aviso: avisoArchivar(editC && editC.id, dogs, guarderias, adiestramiento, td()) || undefined, sub: "Desaparece de tu lista pero conserva todo su historial. Sus paseos que vienen se borran. Queda al final de Clientes, en 'Archivados': ahí lo podés reactivar o, si querés, eliminarlo del todo.", onOk: () => { doArchiveCl(editC.id); setConfArch(false); setEditC(null); }, onCancel: () => setConfArch(false) })))),
-        dlgBorrarCli,
+        !enPC && dlgBorrarCli,
         bajaM && (() => {
             const cl = clients.find(c => c.id === bajaM.cid);
-            const plan = bajaM.ultimo ? bajaPlan(bajaM.cid, dogs.map(migDog), paseos, bajaM.ultimo, bajaM.dogId, descCli(bajaM.cid)) : { grupos: [], cancelar: 0 };
+            const sinConf = sinConfirmarBaja(paseos, dogs.map(migDog), bajaM.cid, bajaM.dogId, bajaM.ultimo, td());
+            const shDe = p => (bajaM.sinHacer || {})[p.id];
+            const psB = borrarSinHacer(paseos, sinConf.filter(p => shDe(p) === "no").map(p => p.id)).paseos;
+            const faltaSinConf = sinConf.some(p => !shDe(p));
+            const plan = bajaM.ultimo ? bajaPlan(bajaM.cid, dogs.map(migDog), psB, bajaM.ultimo, bajaM.dogId, descCli(bajaM.cid)) : { grupos: [], cancelar: 0 };
             const perroB = bajaM.dogId ? dogs.find(d => d && d.id === bajaM.dogId) : null;
             const MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"];
             const per = x => x.men ? MESES[Number(x.ini.slice(5, 7)) - 1] : ("la semana del " + fechaDiaCorto(x.ini).slice(4));
@@ -17258,7 +17392,7 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
             const faltaMonto = plan.grupos.some(x => elDe(x) === "monto" && !(parseInt(montoDe(x), 10) >= 0));
             const elNum = x => elDe(x) === "monto" ? precioDeNeto(x, parseInt(montoDe(x), 10) || 0) : elDe(x);
             const plataDe = x => (bajaM.plata || {})[x.grpId];
-            const aFav = bajaM.ultimo ? aFavorBaja(bajaM.cid, dogs.map(migDog), paseos, bajaM.ultimo, bajaM.dogId) : { total: 0, ids: [] };
+            const aFav = bajaM.ultimo ? aFavorBaja(bajaM.cid, dogs.map(migDog), psB, bajaM.ultimo, bajaM.dogId) : { total: 0, ids: [] };
             const faltaPlata = plan.grupos.some(x => deMasBaja(x, elNum(x)) > 0 && !plataDe(x)) || (aFav.total > 0 && !(bajaM.plata || {})._aFavor);
             const otros = bajaM.ultimo ? otrosDeBaja(bajaM.cid, dogs.map(migDog), guarderias, adiestramiento, bajaM.ultimo, bajaM.dogId) : [];
             const decO = o => (bajaM.otros || {})[o.id] || { accion: "cancelar" };
@@ -17266,16 +17400,16 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
             const faltaOtros = otros.some(o => decO(o).accion !== "dejar" && o.deMas > 0 && !decO(o).plata);
             const okBaja = !!bajaM.ultimo && !faltaMonto && !faltaPlata && !faltaOtros;
             // Lo que te queda debiendo por ese perro DESPUÉS de la baja (con lo elegido para el período).
-            const deudaX = perroB && okBaja ? (() => {
-                const r = aplicarBaja(dogs, paseos, bajaM.cid, bajaM.ultimo, eleccionesBaja(bajaM.elecciones, bajaM.montos, plan), plan, td(), bajaM.plata || {}, bajaM.dogId);
+            const deudaX = okBaja ? (() => {
+                const r = aplicarBaja(dogs, psB, bajaM.cid, bajaM.ultimo, eleccionesBaja(bajaM.elecciones, bajaM.montos, plan), plan, td(), bajaM.plata || {}, bajaM.dogId);
                 const md = r.dogs.map(migDog), dq = ps => deudaPerroBaja({ clients, mDogs: md, paseos: ps, cid: bajaM.cid, dogId: bajaM.dogId, hoy: td(), congeladas });
-                const tot = dq(r.paseos), resto = tot > 0 ? dq(perdonarDeudaPerro(r.paseos, bajaM.dogId, bajaM.ultimo, plan).paseos) : 0;
+                const tot = dq(r.paseos), resto = tot > 0 ? dq(perdonarDeudaBaja(r.paseos, dogs, bajaM.cid, bajaM.dogId, bajaM.ultimo, plan).paseos) : 0;
                 return { tot, perdona: Math.max(0, tot - resto), resto };
             })() : { tot: 0, perdona: 0, resto: 0 };
             const deudaB = deudaX.tot;
             // Qué hace con lo que debe (BUG-098 2b): solo si hay algo que se pueda perdonar.
-            const faltaDeuda = perroB && deudaX.perdona > 0 && !bajaM.deuda;
-            const okBajaD = okBaja && !faltaDeuda;
+            const faltaDeuda = deudaX.perdona > 0 && !bajaM.deuda;
+            const okBajaD = okBaja && !faltaDeuda && !faltaSinConf;
             const op = (x, k, l, sub) => { const on = elDe(x) === k; return (React.createElement("button", { key: k, className: "pc-baja-op", "data-k": k, "data-on": on ? "1" : "0", onClick: () => setBajaM(b => (Object.assign(Object.assign({}, b), { elecciones: Object.assign(Object.assign({}, b.elecciones), { [x.grpId]: k }) }))), style: { flex: "1 1 90px", padding: "8px 6px", borderRadius: 10, border: `1.5px solid ${on ? C.grn : C.bdr}`, background: on ? C.grn + "22" : "transparent", color: on ? C.txt : C.mut, cursor: "pointer", textAlign: "center" } },
                 React.createElement("div", { style: { fontSize: 13, fontWeight: 800 } }, l),
                 React.createElement("div", { style: { fontSize: 11, marginTop: 2 } }, sub))); };
@@ -17332,22 +17466,35 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
                                     p2("devuelvo", "↩️ Se la devuelvo"),
                                     p2("quedo", "💰 Me la quedo"))));
                     })),
-                perroB && deudaB > 0 && (() => {
-                    const nom = perroB.name || "este perro";
+                sinConf.length > 0 && React.createElement("div", { id: "pc-baja-sinconf", style: { marginBottom: 12, padding: 10, borderRadius: 10, border: `1px solid ${C.bdr}` } },
+                    React.createElement("div", { style: { fontSize: 13, fontWeight: 800, color: C.txt, lineHeight: 1.4, marginBottom: 6 } }, sinConf.length === 1 ? "Este paseo no está confirmado como hecho. ¿Se hizo?" : "Estos paseos no están confirmados como hechos. ¿Se hicieron?"),
+                    sinConf.map(p => {
+                        const dg = dogs.find(d => d && d.id === p.dogId);
+                        const v = shDe(p);
+                        const b3 = (k, t) => { const on = v === k; return React.createElement("button", { key: k, className: "pc-baja-sinconf-op", "data-id": p.id, "data-k": k, "data-on": on ? "1" : "0", onClick: () => setBajaM(b => (Object.assign(Object.assign({}, b), { sinHacer: Object.assign(Object.assign({}, (b.sinHacer || {})), { [p.id]: k }) }))), style: { flex: 1, padding: "7px 6px", borderRadius: 10, border: `1.5px solid ${on ? C.grn : C.bdr}`, background: on ? C.grn + "22" : "transparent", color: on ? C.txt : C.mut, fontSize: 12.5, fontWeight: 700, cursor: "pointer" } }, t); };
+                        return React.createElement("div", { key: p.id, className: "pc-baja-sinconf", style: { padding: "6px 0", borderTop: `1px solid ${C.bdr}` } },
+                            React.createElement("div", { style: { fontSize: 13, fontWeight: 700, color: C.txt, marginBottom: 5 } }, fechaDiaCorto(p.fecha) + (p.fecha === td() ? " (hoy)" : "") + " - " + ((dg && dg.name) || "") + (p.ind ? " (individual)" : "")),
+                            React.createElement("div", { style: { display: "flex", gap: 6 } },
+                                b3("si", p.fecha === td() ? "✓ Sí, se hace" : "✓ Sí, se hizo"),
+                                b3("no", "✕ No, se borra")));
+                    }),
+                    React.createElement("div", { style: { fontSize: 12, color: C.mut, marginTop: 6, lineHeight: 1.4 } }, "Los que se borran no se cobran y no van a Perdiste.")),
+                deudaB > 0 && (() => {
+                    const nom = perroB ? (perroB.name || "este perro") : "";
                     const el = deudaX.perdona > 0 ? bajaM.deuda : null;
                     const opD = (k, t, sub) => { const on = bajaM.deuda === k; return (React.createElement("button", { key: k, className: "pc-baja-deuda-op", "data-k": k, "data-on": on ? "1" : "0", onClick: () => setBajaM(b => (Object.assign(Object.assign({}, b), { deuda: k }))), style: { flex: "1 1 100px", padding: "8px 6px", borderRadius: 10, border: `1.5px solid ${on ? C.amb : C.bdr}`, background: on ? C.amb + "22" : "transparent", color: on ? C.txt : C.mut, cursor: "pointer", textAlign: "center" } },
                         React.createElement("div", { style: { fontSize: 13, fontWeight: 800 } }, t),
                         React.createElement("div", { style: { fontSize: 11, marginTop: 2 } }, sub))); };
                     return React.createElement("div", { id: "pc-baja-deuda", style: { marginBottom: 12, padding: 10, borderRadius: 10, border: `1px solid ${C.amb}66`, background: C.amb + "12" } },
-                        React.createElement("div", { style: { fontSize: 13, fontWeight: 800, color: C.amb, lineHeight: 1.4, marginBottom: deudaX.perdona > 0 ? 6 : 0 } }, deudaX.perdona > 0 ? ("Por " + nom + " te debe " + $(deudaB) + ". ¿Qué hacés con eso?") : ("Por " + nom + " te queda debiendo " + $(deudaB) + " (lo que elegiste arriba): sigue en Cobros hasta que te lo pague.")),
+                        React.createElement("div", { style: { fontSize: 13, fontWeight: 800, color: C.amb, lineHeight: 1.4, marginBottom: deudaX.perdona > 0 ? 6 : 0 } }, deudaX.perdona > 0 ? ((perroB ? "Por " + nom + " te debe " : ((cl && cl.name) || "El cliente") + " te debe ") + $(deudaB) + (perroB ? "" : " de paseos") + ". ¿Qué hacés con eso?") : ((perroB ? "Por " + nom + " te queda debiendo " : ((cl && cl.name) || "El cliente") + " te queda debiendo ") + $(deudaB) + (plan.grupos.length ? " (lo que elegiste arriba)" : " de paseos de acá al último día que todavía no hiciste") + ": sigue en Cobros hasta que te lo pague.")),
                         deudaX.perdona > 0 && React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 6 } },
                             opD("cobro", "💰 Se la cobro", "Sigue en Cobros"),
                             opD("pago", "✅ Ya me la pagó", "Te llevo a Cobrar"),
                             opD("perdono", "🙅 No se la cobro", $(deudaX.perdona) + " a Perdiste")),
-                        el === "perdono" && deudaX.resto > 0 && React.createElement("div", { style: { fontSize: 12, color: C.mut, marginTop: 6, lineHeight: 1.4 } }, "Queda " + $(deudaX.resto) + " del período en curso (lo que elegiste arriba)."));
+                        el === "perdono" && deudaX.resto > 0 && React.createElement("div", { style: { fontSize: 12, color: C.mut, marginTop: 6, lineHeight: 1.4 } }, "Queda " + $(deudaX.resto) + (plan.grupos.length ? " del período en curso (lo que elegiste arriba)." : " de paseos de acá al último día que todavía no hiciste.")));
                 })(),
                 React.createElement("div", { style: { fontSize: 12, color: C.mut, lineHeight: 1.4, marginBottom: 12 } }, perroB ? ("Lo hecho y lo cobrado queda. " + ((cl && cl.name) || "El cliente") + " sigue con sus otros perros. Lo podés deshacer desde Editar " + (perroB.name || "perro") + ".") : "El día siguiente al último se archiva solo (conserva todo su historial). Lo podés deshacer desde Editar cliente."),
-                React.createElement("button", { id: "pc-baja-ok", disabled: !okBajaD, onClick: () => confirmarBaja(perroB && deudaX.perdona > 0 ? bajaM.deuda : null), style: Object.assign(Object.assign({}, BR("primario", false)), { width: "100%", opacity: okBajaD ? 1 : .5 }) }, !bajaM.ultimo ? "Elegí el último día" : (faltaMonto ? "Poné cuánto le cobrás" : (faltaPlata || faltaOtros) ? "Elegí qué hacés con la plata de más" : faltaDeuda ? "Elegí qué hacés con lo que debe" : ("Confirmar: último día " + fechaDiaCorto(bajaM.ultimo))))));
+                React.createElement("button", { id: "pc-baja-ok", disabled: !okBajaD, onClick: () => confirmarBaja(deudaX.perdona > 0 ? bajaM.deuda : null), style: Object.assign(Object.assign({}, BR("primario", false)), { width: "100%", opacity: okBajaD ? 1 : .5 }) }, !bajaM.ultimo ? "Elegí el último día" : (faltaMonto ? "Poné cuánto le cobrás" : (faltaPlata || faltaOtros) ? "Elegí qué hacés con la plata de más" : faltaSinConf ? "Decí si se hizo cada paseo" : faltaDeuda ? "Elegí qué hacés con lo que debe" : ("Confirmar: último día " + fechaDiaCorto(bajaM.ultimo))))));
         })(),
         editD && (React.createElement(Modal, { onClose: () => setEditD(null), title: "Editar " + editD.name },
             (() => { const cl = clients.find(x => x.id === editD.cid); return cl ? React.createElement("div", { style: { fontSize: 13, color: C.mut, marginTop: -8, marginBottom: 12 } }, "de " + cl.name) : null; })(),
@@ -17521,6 +17668,7 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
                         React.createElement("button", { id: "pc-borrar-perro-cancelar", onClick: () => setDelD(null), style: Object.assign(Object.assign({}, BR("secundario", false)), { flex: 1 }) }, "Cancelar"),
                         React.createElement("button", { id: "pc-borrar-perro-ok", onClick: () => doDelDog(delD), style: Object.assign(Object.assign({}, Btn("#7f1d1d", C.txt)), { flex: 1 }) }, "Eliminar"))))));
         })()));
+    return enPC ? enDosCol(vistaLista, vistaDetalle) : vistaDetalle;
 }
 /* └── FIN: screens/Clientes.jsx ─────────────────────────────────────────── */
 /* ┌─────────────────────────────────────────────────────────────────────────┐
@@ -17998,7 +18146,7 @@ function diaMasCargado(paseos, ym) {
         return { dias, perrosProm: dias ? Math.round(x.n / dias * 10) / 10 : 0, minsProm: fm.length ? Math.round(fm.reduce((a, b) => a + b, 0) / fm.length) : 0 };
     });
 }
-function Stats({ svc, waTpl, paseos, clients, selWk, onWk, selMo, onMo, sec, onSec, mDogs, routes, gg, guarderias, adiestramiento, edgeMemory, ajustes, congeladas, ajPeriodo, lugares, velMin, ventas, setVentas }) {
+function Stats({ svc, waTpl, paseos, clients, selWk, onWk, selMo, onMo, sec, onSec, mDogs, routes, gg, guarderias, adiestramiento, edgeMemory, ajustes, congeladas, ajPeriodo, lugares, velMin, ventas, setVentas, enPC }) {
     const T = td();
     // View-model: toda la derivación global vive acá. Función pura, testeable.
     const vm = useMemo(() => buildStatsViewModel({ clients, mDogs, paseos, selWk, selMo, hoy: T, congeladas, ajPeriodo }), [clients, mDogs, paseos, selWk, selMo, T, congeladas, ajPeriodo]);
@@ -18090,14 +18238,16 @@ function Stats({ svc, waTpl, paseos, clients, selWk, onWk, selMo, onMo, sec, onS
     return (React.createElement("div", null,
         React.createElement("div", { style: { fontWeight: 800, fontSize: 18, color: C.txt, marginBottom: 10 } }, "Stats"),
         React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(" + SECS.length + ",minmax(0,1fr))", gap: 6, marginBottom: 12 } }, SECS.map(([v, l]) => (React.createElement("button", { key: v, className: "pc-st-sec", onClick: () => onSec(v), style: { padding: "9px 2px", borderRadius: 10, border: "none", cursor: "pointer", background: secV === v ? C.grn : C.cl, color: secV === v ? "#0f1a14" : C.mut, fontSize: 13, fontWeight: 700, minWidth: 0 } }, l)))),
-        secV === "resumen" && (React.createElement("div", null,
-            React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 12, background: C.cl, borderRadius: 12, padding: 3 } },
+        secV === "resumen" && (React.createElement("div", { id: "pc-st-res", style: enPC ? { display: "grid", gridTemplateColumns: "minmax(0,1fr) minmax(0,1fr)", gap: 20, alignItems: "start" } : undefined },
+            enPC && React.createElement("div", { style: { gridColumn: "1 / -1" } },
+                React.createElement(ParaMirar, null)),
+            !enPC && React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 12, background: C.cl, borderRadius: 12, padding: 3 } },
                 React.createElement("button", { onClick: () => { setResPer("sem"); setDesdeMes(null); }, style: { flex: 1, padding: "9px 2px", borderRadius: 9, border: "none", fontWeight: 700, fontSize: 13, cursor: "pointer", background: resPer === "sem" ? C.grn : "transparent", color: resPer === "sem" ? "#0f1a14" : C.mut } }, "Semana"),
                 React.createElement("button", { onClick: () => { setResPer("mes"); setDesdeMes(null); }, style: { flex: 1, padding: "9px 2px", borderRadius: 9, border: "none", fontWeight: 700, fontSize: 13, cursor: "pointer", background: resPer === "mes" ? C.grn : "transparent", color: resPer === "mes" ? "#0f1a14" : C.mut } }, "Mes")),
-            resPer === "sem" && (React.createElement("div", null,
+            (enPC || resPer === "sem") && (React.createElement("div", { className: "pc-st-col", "data-per": "sem", style: { minWidth: 0 } },
                 React.createElement(NB, { lbl: rangoCorto(wr.from, wr.to), onP: () => onWk(addWks(selWk, -1)), onN: () => onWk(addWks(selWk, 1)), isCur: isCurW }),
                 React.createElement(StatGeneralCard, { cob: rsSem.cob, perd: rsSem.perdVista, deMas: rsSem.deMas, rest: rsSem.rest, antes: rsSem.antes, cxlCli: rsSem.pf.cxlCliente, desg: { sobrante: rsSem.sobrante }, det: rsSem.det }),
-                React.createElement(ParaMirar, null),
+                !enPC && React.createElement(ParaMirar, null),
                 React.createElement(OrigenPlata, { svc: svc, partes: rsSem.partes, tab: resTab, onTab: setResTab }),
                 resTab === "ven" && React.createElement(VentasResumen, { ventas: ventas, setVentas: setVentas, from: wr.from, to: wr.to }),
                 resTab === "adi" && (() => { const adi = buildAdiestraPeriodo(adiestramiento, wr.from, wr.to); const cel = (lbl, val, col) => (React.createElement("div", { style: Object.assign(Object.assign({}, CARD), { flex: 1, textAlign: "center" }) },
@@ -18134,7 +18284,7 @@ function Stats({ svc, waTpl, paseos, clients, selWk, onWk, selMo, onMo, sec, onS
                     })(),
                     React.createElement("div", { id: "pc-desglose-semana", style: Object.assign(Object.assign({}, CARD), { scrollMarginTop: 8 }) },
                         React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, marginBottom: 10 } },
-                            desdeMes && React.createElement("button", { "aria-label": "Volver al mes", onClick: () => { setResPer("mes"); setDesdeMes(null); setTimeout(() => { try {
+                            desdeMes && !enPC && React.createElement("button", { "aria-label": "Volver al mes", onClick: () => { setResPer("mes"); setDesdeMes(null); setTimeout(() => { try {
                                     const el = document.getElementById("pc-semana-a-semana");
                                     if (el)
                                         el.scrollIntoView({ block: "start" });
@@ -18164,56 +18314,56 @@ function Stats({ svc, waTpl, paseos, clients, selWk, onWk, selMo, onMo, sec, onS
                                         React.createElement("div", { style: { fontSize: 12, color: C.mut } }, r + " realizados - " + gruposReales(dog).length + (gruposReales(dog).length !== 1 ? " planes" : " plan")),
                                         notasAbonoMensual(paseos, dog, dp, wr.from, wr.to).map((t, i) => (React.createElement("div", { key: "am" + i, style: { fontSize: 12, color: C.blu, marginTop: 2 } }, t)))),
                                     React.createElement("div", { style: { fontWeight: 800, color: C.grn, fontSize: 14 } }, $(cob)))));
+                        })))))),
+            (enPC || resPer === "mes") && (React.createElement("div", { className: "pc-st-col", "data-per": "mes", style: { minWidth: 0 } },
+                React.createElement(NB, { lbl: MONTHS[parseInt(selMo.split("-")[1]) - 1] + " " + selMo.split("-")[0], onP: () => onMo(addMos(selMo, -1)), onN: () => onMo(addMos(selMo, 1)), isCur: isCurM }),
+                React.createElement(StatGeneralCard, { cob: rsMes.cob, perd: rsMes.perdVista, deMas: rsMes.deMas, rest: rsMes.rest, antes: rsMes.antes, cxlCli: rsMes.pf.cxlCliente, desg: { sobrante: rsMes.sobrante }, det: rsMes.det }),
+                !enPC && React.createElement(ParaMirar, null),
+                (cmp.pct !== null || histVisible.length > 1) && (React.createElement("div", { id: "pc-st-compara", style: CARD },
+                    cmp.pct !== null && (React.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 } },
+                        React.createElement("div", { style: { minWidth: 0 } },
+                            React.createElement("div", { style: { fontSize: 14, fontWeight: 800, color: C.txt } }, "vs " + MONTHS[Number(cmp.prev.slice(5, 7)) - 1].toLowerCase() + (cmp.alDia ? " (al día " + cmp.alDia + ")" : "")),
+                            React.createElement("div", { style: { fontSize: 12, color: C.mut } }, "el mes pasado: " + $(Math.round(cmp.cobPrev)))),
+                        React.createElement("div", { id: "pc-st-pct", style: { fontWeight: 800, fontSize: 20, color: cmp.pct >= 0 ? C.grn : C.amb, flexShrink: 0 } }, (cmp.pct >= 0 ? "▲ " : "▼ ") + Math.abs(cmp.pct) + "%"))),
+                    histVisible.length > 1 && React.createElement(BarrasMes, { datos: histVisible.map(h => ({ ym: h.ym, v: h.total, enCurso: h.ym === selMo })), col: C.grn }),
+                    histVisible.length > 1 && React.createElement("div", { style: { fontSize: 12, color: C.mut, marginTop: 6 } }, "Lo cobrado cada mes, todo junto"))),
+                React.createElement(OrigenPlata, { svc: svc, partes: rsMes.partes, tab: resTab, onTab: setResTab }),
+                resTab === "ven" && React.createElement(VentasResumen, { ventas: ventas, setVentas: setVentas, from: selMo + "-01", to: selMo + "-" + String(new Date(parseInt(selMo.slice(0, 4)), parseInt(selMo.slice(5, 7)), 0).getDate()).padStart(2, "0") }),
+                resTab === "adi" && (() => { const [my, mm] = selMo.split("-"); const moFrom = selMo + "-01"; const moTo = selMo + "-" + (new Date(parseInt(my), parseInt(mm), 0).getDate()); const adi = buildAdiestraPeriodo(adiestramiento, moFrom, moTo); const cel = (lbl, val, col) => (React.createElement("div", { style: Object.assign(Object.assign({}, CARD), { flex: 1, textAlign: "center" }) },
+                    React.createElement("div", { style: { fontSize: 12, color: C.mut, fontWeight: 700, marginBottom: 4 } }, lbl),
+                    React.createElement("div", { style: { fontSize: 18, fontWeight: 800, color: col } }, val))); return (React.createElement("div", null,
+                    React.createElement("div", { style: { display: "flex", gap: 8, marginBottom: 8 } },
+                        cel("Cobrado", $(adi.cobrado), C.grn),
+                        cel("Pendiente", $(adi.pendiente), C.amb)),
+                    React.createElement("div", { style: { display: "flex", gap: 8 } },
+                        cel("Facturado", $(adi.facturado), C.blu),
+                        cel("Clases", String(adi.count), C.txt)),
+                    React.createElement("div", { style: { fontSize: 12, color: C.mut, textAlign: "center", fontStyle: "italic", marginTop: 10 } }, "Cobrado = lo pagado de las clases del mes · Pendiente/Facturado = clases del mes"),
+                    React.createElement(ClasesDetalle, { series: adiestramiento, from: moFrom, to: moTo, mDogs: mDogs, clients: clients }),
+                    React.createElement(TemasTrabajados, { series: adiestramiento, from: moFrom, to: moTo }))); })(),
+                resTab === "est" && (() => { const [my, mm] = selMo.split("-"); const moFrom = selMo + "-01"; const moTo = selMo + "-" + (new Date(parseInt(my), parseInt(mm), 0).getDate()); return React.createElement(StatEstadiaPanel, { est: buildEstadiaStats(guarderias, moFrom, moTo), senas: senasRecibidas(guarderias, moFrom, moTo), senasDet: senasRecibidasDetalle(guarderias, moFrom, moTo), mDogs: mDogs }); })(),
+                resTab === "pas" && (React.createElement("div", null,
+                    React.createElement(StatPaseoPanel, { titulo: MONTHS[parseInt(selMo.split("-")[1]) - 1].toLowerCase(), cob: rsMes.pf.cajaAtribuida, rest: rsMes.pf.pendienteCaja, realizados: mp.filter(p => p.status === "completado").length, cxlCli: rsMes.pf.cxlCliente, cxlYo: rsMes.pf.cxlYo, cxlExt: cxlNoPaseo(rsMes.pf) }),
+                    React.createElement("div", { id: "pc-semana-a-semana", style: CARD },
+                        React.createElement("div", { style: { fontWeight: 700, fontSize: 13, color: C.txt, marginBottom: 10 } }, "Semana a semana"),
+                        semsDelMes.map(w2 => {
+                            // NETO de descuentos (fuente unica cobradoNetoPeriodo): la semana
+                            // muestra el neto (74k), no el bruto (89k) — bug 05/08.
+                            const ing = cobradoNetoPeriodo(paseos, mDogs, w2.from, w2.to, null, ajPeriodo);
+                            const r = paseos.filter(p => p.fecha >= w2.from && p.fecha <= w2.to && p.status === "completado").length;
+                            const isCurr = w2.from === wkRange(T).from, isFut = w2.from > wkRange(T).from;
+                            return (React.createElement("div", { key: w2.from, onClick: () => { onWk(w2.from); onSec("resumen"); setResPer("sem"); setDesdeMes(selMo); setResTab("pas"); setTimeout(() => { try {
+                                    const el = document.getElementById("pc-desglose-semana");
+                                    if (el)
+                                        el.scrollIntoView({ block: "start" });
+                                }
+                                catch (e) { } }, 60); }, style: { display: "flex", alignItems: "center", gap: 10, paddingBottom: 10, marginBottom: 10, borderBottom: `1px solid ${C.bdr}`, opacity: isFut ? 0.4 : 1, cursor: "pointer" } },
+                                React.createElement("div", { style: { flex: 1 } },
+                                    React.createElement("div", { style: { fontWeight: isCurr ? 800 : 600, fontSize: 13, color: isCurr ? C.grn : C.txt } }, rangoCorto(w2.from, w2.to) + (isCurr ? " (esta)" : "")),
+                                    React.createElement("div", { style: { fontSize: 12, color: C.mut } }, r + (r === 1 ? " paseo" : " paseos"))),
+                                React.createElement("div", { style: { fontWeight: 800, fontSize: 14, color: isCurr ? C.grn : C.txt } }, $(ing)),
+                                React.createElement("span", { style: { color: C.mut } }, ">")));
                         })))))))),
-        secV === "resumen" && resPer === "mes" && (React.createElement("div", null,
-            React.createElement(NB, { lbl: MONTHS[parseInt(selMo.split("-")[1]) - 1] + " " + selMo.split("-")[0], onP: () => onMo(addMos(selMo, -1)), onN: () => onMo(addMos(selMo, 1)), isCur: isCurM }),
-            React.createElement(StatGeneralCard, { cob: rsMes.cob, perd: rsMes.perdVista, deMas: rsMes.deMas, rest: rsMes.rest, antes: rsMes.antes, cxlCli: rsMes.pf.cxlCliente, desg: { sobrante: rsMes.sobrante }, det: rsMes.det }),
-            React.createElement(ParaMirar, null),
-            (cmp.pct !== null || histVisible.length > 1) && (React.createElement("div", { id: "pc-st-compara", style: CARD },
-                cmp.pct !== null && (React.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 } },
-                    React.createElement("div", { style: { minWidth: 0 } },
-                        React.createElement("div", { style: { fontSize: 14, fontWeight: 800, color: C.txt } }, "vs " + MONTHS[Number(cmp.prev.slice(5, 7)) - 1].toLowerCase() + (cmp.alDia ? " (al día " + cmp.alDia + ")" : "")),
-                        React.createElement("div", { style: { fontSize: 12, color: C.mut } }, "el mes pasado: " + $(Math.round(cmp.cobPrev)))),
-                    React.createElement("div", { id: "pc-st-pct", style: { fontWeight: 800, fontSize: 20, color: cmp.pct >= 0 ? C.grn : C.amb, flexShrink: 0 } }, (cmp.pct >= 0 ? "▲ " : "▼ ") + Math.abs(cmp.pct) + "%"))),
-                histVisible.length > 1 && React.createElement(BarrasMes, { datos: histVisible.map(h => ({ ym: h.ym, v: h.total, enCurso: h.ym === selMo })), col: C.grn }),
-                histVisible.length > 1 && React.createElement("div", { style: { fontSize: 12, color: C.mut, marginTop: 6 } }, "Lo cobrado cada mes, todo junto"))),
-            React.createElement(OrigenPlata, { svc: svc, partes: rsMes.partes, tab: resTab, onTab: setResTab }),
-            resTab === "ven" && React.createElement(VentasResumen, { ventas: ventas, setVentas: setVentas, from: selMo + "-01", to: selMo + "-" + String(new Date(parseInt(selMo.slice(0, 4)), parseInt(selMo.slice(5, 7)), 0).getDate()).padStart(2, "0") }),
-            resTab === "adi" && (() => { const [my, mm] = selMo.split("-"); const moFrom = selMo + "-01"; const moTo = selMo + "-" + (new Date(parseInt(my), parseInt(mm), 0).getDate()); const adi = buildAdiestraPeriodo(adiestramiento, moFrom, moTo); const cel = (lbl, val, col) => (React.createElement("div", { style: Object.assign(Object.assign({}, CARD), { flex: 1, textAlign: "center" }) },
-                React.createElement("div", { style: { fontSize: 12, color: C.mut, fontWeight: 700, marginBottom: 4 } }, lbl),
-                React.createElement("div", { style: { fontSize: 18, fontWeight: 800, color: col } }, val))); return (React.createElement("div", null,
-                React.createElement("div", { style: { display: "flex", gap: 8, marginBottom: 8 } },
-                    cel("Cobrado", $(adi.cobrado), C.grn),
-                    cel("Pendiente", $(adi.pendiente), C.amb)),
-                React.createElement("div", { style: { display: "flex", gap: 8 } },
-                    cel("Facturado", $(adi.facturado), C.blu),
-                    cel("Clases", String(adi.count), C.txt)),
-                React.createElement("div", { style: { fontSize: 12, color: C.mut, textAlign: "center", fontStyle: "italic", marginTop: 10 } }, "Cobrado = lo pagado de las clases del mes · Pendiente/Facturado = clases del mes"),
-                React.createElement(ClasesDetalle, { series: adiestramiento, from: moFrom, to: moTo, mDogs: mDogs, clients: clients }),
-                React.createElement(TemasTrabajados, { series: adiestramiento, from: moFrom, to: moTo }))); })(),
-            resTab === "est" && (() => { const [my, mm] = selMo.split("-"); const moFrom = selMo + "-01"; const moTo = selMo + "-" + (new Date(parseInt(my), parseInt(mm), 0).getDate()); return React.createElement(StatEstadiaPanel, { est: buildEstadiaStats(guarderias, moFrom, moTo), senas: senasRecibidas(guarderias, moFrom, moTo), senasDet: senasRecibidasDetalle(guarderias, moFrom, moTo), mDogs: mDogs }); })(),
-            resTab === "pas" && (React.createElement("div", null,
-                React.createElement(StatPaseoPanel, { titulo: MONTHS[parseInt(selMo.split("-")[1]) - 1].toLowerCase(), cob: rsMes.pf.cajaAtribuida, rest: rsMes.pf.pendienteCaja, realizados: mp.filter(p => p.status === "completado").length, cxlCli: rsMes.pf.cxlCliente, cxlYo: rsMes.pf.cxlYo, cxlExt: cxlNoPaseo(rsMes.pf) }),
-                React.createElement("div", { id: "pc-semana-a-semana", style: CARD },
-                    React.createElement("div", { style: { fontWeight: 700, fontSize: 13, color: C.txt, marginBottom: 10 } }, "Semana a semana"),
-                    semsDelMes.map(w2 => {
-                        // NETO de descuentos (fuente unica cobradoNetoPeriodo): la semana
-                        // muestra el neto (74k), no el bruto (89k) — bug 05/08.
-                        const ing = cobradoNetoPeriodo(paseos, mDogs, w2.from, w2.to, null, ajPeriodo);
-                        const r = paseos.filter(p => p.fecha >= w2.from && p.fecha <= w2.to && p.status === "completado").length;
-                        const isCurr = w2.from === wkRange(T).from, isFut = w2.from > wkRange(T).from;
-                        return (React.createElement("div", { key: w2.from, onClick: () => { onWk(w2.from); onSec("resumen"); setResPer("sem"); setDesdeMes(selMo); setResTab("pas"); setTimeout(() => { try {
-                                const el = document.getElementById("pc-desglose-semana");
-                                if (el)
-                                    el.scrollIntoView({ block: "start" });
-                            }
-                            catch (e) { } }, 60); }, style: { display: "flex", alignItems: "center", gap: 10, paddingBottom: 10, marginBottom: 10, borderBottom: `1px solid ${C.bdr}`, opacity: isFut ? 0.4 : 1, cursor: "pointer" } },
-                            React.createElement("div", { style: { flex: 1 } },
-                                React.createElement("div", { style: { fontWeight: isCurr ? 800 : 600, fontSize: 13, color: isCurr ? C.grn : C.txt } }, rangoCorto(w2.from, w2.to) + (isCurr ? " (esta)" : "")),
-                                React.createElement("div", { style: { fontSize: 12, color: C.mut } }, r + (r === 1 ? " paseo" : " paseos"))),
-                            React.createElement("div", { style: { fontWeight: 800, fontSize: 14, color: isCurr ? C.grn : C.txt } }, $(ing)),
-                            React.createElement("span", { style: { color: C.mut } }, ">")));
-                    })))))),
         secV === "clientes" && (React.createElement("div", { style: { display: "flex", gap: 6, marginBottom: 12, background: C.cl, borderRadius: 12, padding: 3 } }, [["cli", "👤 Clientes"], ["perros", "🐶 Perros"]].map(([v, l]) => (React.createElement("button", { key: v, className: "pc-st-cliv", onClick: () => setCliVista(v), style: { flex: 1, padding: "9px 2px", borderRadius: 9, border: "none", fontWeight: 700, fontSize: 13, cursor: "pointer", background: cliVista === v ? C.grn : "transparent", color: cliVista === v ? "#0f1a14" : C.mut } }, l))))),
         secV === "clientes" && cliVista === "cli" && (() => {
             const cliEnr = clStats.map(cs => {
@@ -20306,6 +20456,8 @@ function App() {
     }
     catch (e) { } }; }, []);
     const enPC = modoPantalla(anchoV / normScale(cfg && cfg.textScale)) === "pc";
+    // Parte 2: Clientes (y Cobros) usan dos columnas → más ancho.
+    const anchoPC = anchoPCSeccion(tab, sec);
     const irTab = id => { setTab(id); if (id !== "cobros")
         setClienteFoco(null); };
     const [rescateVisto, setRescateVisto] = useState(() => PC_RESCATE.motivo === "vacio" ? false : true);
@@ -20934,7 +21086,7 @@ function App() {
             React.createElement("div", { style: { fontSize: 12, color: C.mut, marginTop: 8, lineHeight: 1.45 } }, "Sin contraseña: te llega un código por mail para entrar. Tus datos quedan en el servidor de PaseoCan, no se comparten con nadie y podés salir cuando quieras."))),
         nubeUI.msg && React.createElement("div", { id: "pc-nube-msg", style: { fontSize: 12.5, color: C.red || C.amb, marginTop: 8, fontWeight: 700 } }, nubeUI.msg)));
     return (React.createElement(SvcCtx.Provider, { value: svc },
-        React.createElement("div", { id: "pc-app", "data-modo": enPC ? "pc" : "cel", style: Object.assign({ fontFamily: "'Segoe UI',system-ui,sans-serif", background: C.bg, minHeight: "100vh", color: C.txt }, (enPC ? { maxWidth: 780, marginLeft: "max(236px, calc((100% - 780px) / 2 + 110px))", marginRight: "auto" } : { maxWidth: 480, margin: "0 auto" })) },
+        React.createElement("div", { id: "pc-app", "data-modo": enPC ? "pc" : "cel", style: Object.assign({ fontFamily: "'Segoe UI',system-ui,sans-serif", background: C.bg, minHeight: "100vh", color: C.txt }, (enPC ? { maxWidth: "min(" + anchoPC + "px, calc(100% - 256px))", marginLeft: "max(236px, calc((100% - " + anchoPC + "px) / 2 + 110px))", marginRight: "auto" } : { maxWidth: 480, margin: "0 auto" })) },
             enPC && React.createElement("nav", { id: "pc-nav-lateral", "aria-label": "Secciones", style: { position: "fixed", left: 0, top: 0, bottom: 0, width: 216, background: C.card, borderRight: `1px solid ${C.bdr}`, padding: "22px 12px", boxSizing: "border-box", zIndex: 100, display: "flex", flexDirection: "column", gap: 6 } },
                 React.createElement("div", { style: { fontSize: 20, fontWeight: 900, color: C.grn, padding: "0 10px 18px" } }, "🐾 PaseoCan"),
                 NAV_TABS.map(t => {
@@ -21058,7 +21210,7 @@ function App() {
                     React.createElement("div", { style: { flex: 1, minWidth: 0, fontSize: 13, color: C.txt, lineHeight: 1.45 } }, guia.listo || guiaPaso(guia.k)),
                     React.createElement("button", { id: "pc-guia-cerrar", "aria-label": "Cerrar", onClick: () => setGuia(null), style: { background: "none", border: "none", color: C.mut, fontSize: 15, cursor: "pointer", padding: "0 2px", flexShrink: 0 } }, "✕"))),
                 tab === "agenda" && (() => {
-                    const nov = novedadesPendientes(novVisto, (clients || []).length > 0).slice(0, 5);
+                    const nov = novedadesPendientes(novVisto, (clients || []).length > 0).slice(0, 6);
                     if (!nov.length)
                         return null;
                     return (React.createElement("div", { id: "pc-novedades", style: { background: C.card, border: `1.5px solid ${C.blu}66`, borderRadius: 14, padding: "12px 12px 8px", marginBottom: 14 } },
@@ -21088,10 +21240,10 @@ function App() {
                             !x.hecho && React.createElement("button", { className: "pc-primeros-sacar", "aria-label": "Sacar de la Agenda", onClick: e => { e.stopPropagation(); sacarAv({ k: "pp:" + x.k, firma: "1" }); if (guia && guia.k === x.k)
                                     setGuia(null); }, style: { background: "transparent", border: "none", color: C.mut, fontSize: 15, padding: "2px 6px", cursor: "pointer", flexShrink: 0 } }, "✕"))))));
                 })(),
-                tab === "agenda" && React.createElement(Agenda, { svc: svc, avisosApp: avisosApp, avisosBase: avisosBase, pendientes: pendVig, pide: pideAgenda, setWaTpl: setWaTpl, partes: partes, setPartes: setPartes, ventas: ventas, setVentas: setVentas, articulos: articulos, setArticulos: setArticulos, waTpl: waTpl, cfg: cfg, setCfg: setCfg, paseos: realPs, setPaseos: setPaseos, dogs: dogs, setDogs: setDogs, clients: clients, gg: gg, setGG: setGG, mDogs: mDogs, routes: routes, setRoutes: setRoutes, edgeMemory: edgeMemory, setEdgeMemory: setEdgeMemory, globalRoute: globalRoute, guarderias: guarderias, setGuarderias: setGuarderias, onGoFicha: dogId => { setDogEditFoco(dogId); setTab("clientes"); }, onAdd: f => { setNWalk(w => (Object.assign(Object.assign({}, w), { fecha: f, que: null }))); setAddWalk(f); }, onAddEstadia: f => { setNGuard(g => (Object.assign(Object.assign({}, g), { fecha: f, desde: f, hasta: f, pago: undefined, sena: "" }))); setAddGuard(f); }, onEditSerie: openEditSerie, onGoCobros: () => setTab("cobros"), onEstadiaConfirm: () => notifyUse("estadias"), adiestramiento: adiestramiento, setAdiestramiento: setAdiestramiento, onAddClase: openAddClase, onEditClase: openEditClase, onRutaInforme: () => notifyUse("rutas"), congeladas: congeladas }),
-                tab === "clientes" && React.createElement(Clientes, { cfg: cfg, setCfg: setCfg, partes: partes, setPartes: setPartes, setWaTpl: setWaTpl, svc: svc, onAbrirAcuerdos: () => { setCfgSecc("acuerdos"); setShowCfg(true); }, waTpl: waTpl, dogs: dogs, setDogs: setDogs, clients: clients, setClients: setClients, paseos: realPs, setPaseos: setPaseos, gg: gg, setGG: g => { const v = typeof g === "function" ? g(gg) : g; setGG(v); saveLS("pc_groups", v); }, mDogs: mDogs, routes: routes, edgeMemory: edgeMemory, guarderias: guarderias, setGuarderias: setGuarderias, adiestramiento: adiestramiento, setAdiestramiento: setAdiestramiento, congeladas: congeladas, onEditSerie: openEditSerie, onEditClase: openEditClase, onEditEstadia: openEditEstadia, onAddEstadia: openAddEstadiaPerro, onAddClase: openAddClasePerro, onAdd: () => setAddCl(true), onGoCobros: id => { setClienteFoco(id); setTab("cobros"); }, clienteInicial: nuevoClienteId, onClienteInicialUsado: () => setNuevoClienteId(null), dogEditInicial: dogEditFoco, onDogEditConsumed: () => setDogEditFoco(null), ajustes: ajustes, ajPeriodo: ajPeriodo }),
-                tab === "cobros" && React.createElement(Cobros, { svc: svc, ventas: ventas, paseos: realPs, setPaseos: setPaseos, clients: clients, mDogs: mDogs, guarderias: guarderias, setGuarderias: setGuarderias, adiestramiento: adiestramiento, setAdiestramiento: setAdiestramiento, clienteFoco: clienteFoco, onUse: () => notifyUse("cobros"), onVolverClientes: clienteFoco ? () => { setClienteFoco(null); setTab("clientes"); } : null, ajustes: ajustes, setAjustes: setAjustes, congeladas: congeladas, ajPeriodo: ajPeriodo, setAjPeriodo: setAjPeriodo }),
-                tab === "stats" && React.createElement(Stats, { svc: svc, waTpl: waTpl, ventas: ventas, setVentas: setVentas, velMin: (cfg && cfg.minPorKm) || 15, paseos: realPs, clients: clients, mDogs: mDogs, routes: routes, gg: gg, guarderias: guarderias, adiestramiento: adiestramiento, edgeMemory: edgeMemory, selWk: selWk, onWk: setSelWk, selMo: selMo, onMo: setSelMo, sec: sec, onSec: setSec, ajustes: ajustes, congeladas: congeladas, ajPeriodo: ajPeriodo, lugares: cfgLugares(cfg) })),
+                tab === "agenda" && React.createElement(Agenda, { svc: svc, avisosApp: avisosApp, avisosBase: avisosBase, pendientes: pendVig, pide: pideAgenda, setWaTpl: setWaTpl, partes: partes, setPartes: setPartes, ventas: ventas, setVentas: setVentas, articulos: articulos, setArticulos: setArticulos, waTpl: waTpl, cfg: cfg, setCfg: setCfg, paseos: realPs, setPaseos: setPaseos, dogs: dogs, setDogs: setDogs, clients: clients, gg: gg, setGG: setGG, mDogs: mDogs, routes: routes, setRoutes: setRoutes, edgeMemory: edgeMemory, setEdgeMemory: setEdgeMemory, globalRoute: globalRoute, guarderias: guarderias, setGuarderias: setGuarderias, onGoFicha: dogId => { setDogEditFoco(dogId); setTab("clientes"); }, onAdd: f => { setNWalk(w => (Object.assign(Object.assign({}, w), { fecha: f, que: null }))); setAddWalk(f); }, onAddEstadia: f => { setNGuard(g => (Object.assign(Object.assign({}, g), { fecha: f, desde: f, hasta: f, pago: undefined, sena: "" }))); setAddGuard(f); }, onEditSerie: openEditSerie, onGoCobros: () => setTab("cobros"), onEstadiaConfirm: () => notifyUse("estadias"), adiestramiento: adiestramiento, setAdiestramiento: setAdiestramiento, onAddClase: openAddClase, onEditClase: openEditClase, onRutaInforme: () => notifyUse("rutas"), congeladas: congeladas, enPC: enPC }),
+                tab === "clientes" && React.createElement(Clientes, { cfg: cfg, setCfg: setCfg, partes: partes, setPartes: setPartes, setWaTpl: setWaTpl, svc: svc, onAbrirAcuerdos: () => { setCfgSecc("acuerdos"); setShowCfg(true); }, waTpl: waTpl, dogs: dogs, setDogs: setDogs, clients: clients, setClients: setClients, paseos: realPs, setPaseos: setPaseos, gg: gg, setGG: g => { const v = typeof g === "function" ? g(gg) : g; setGG(v); saveLS("pc_groups", v); }, mDogs: mDogs, routes: routes, edgeMemory: edgeMemory, guarderias: guarderias, setGuarderias: setGuarderias, adiestramiento: adiestramiento, setAdiestramiento: setAdiestramiento, congeladas: congeladas, onEditSerie: openEditSerie, onEditClase: openEditClase, onEditEstadia: openEditEstadia, onAddEstadia: openAddEstadiaPerro, onAddClase: openAddClasePerro, onAdd: () => setAddCl(true), onGoCobros: id => { setClienteFoco(id); setTab("cobros"); }, clienteInicial: nuevoClienteId, onClienteInicialUsado: () => setNuevoClienteId(null), dogEditInicial: dogEditFoco, onDogEditConsumed: () => setDogEditFoco(null), enPC: enPC, ajustes: ajustes, ajPeriodo: ajPeriodo }),
+                tab === "cobros" && React.createElement(Cobros, { svc: svc, ventas: ventas, paseos: realPs, setPaseos: setPaseos, clients: clients, mDogs: mDogs, guarderias: guarderias, setGuarderias: setGuarderias, adiestramiento: adiestramiento, setAdiestramiento: setAdiestramiento, clienteFoco: clienteFoco, onUse: () => notifyUse("cobros"), onVolverClientes: clienteFoco ? () => { setClienteFoco(null); setTab("clientes"); } : null, ajustes: ajustes, setAjustes: setAjustes, congeladas: congeladas, ajPeriodo: ajPeriodo, setAjPeriodo: setAjPeriodo, enPC: enPC }),
+                tab === "stats" && React.createElement(Stats, { svc: svc, waTpl: waTpl, ventas: ventas, setVentas: setVentas, velMin: (cfg && cfg.minPorKm) || 15, paseos: realPs, clients: clients, mDogs: mDogs, routes: routes, gg: gg, guarderias: guarderias, adiestramiento: adiestramiento, edgeMemory: edgeMemory, selWk: selWk, onWk: setSelWk, selMo: selMo, onMo: setSelMo, sec: sec, onSec: setSec, ajustes: ajustes, congeladas: congeladas, ajPeriodo: ajPeriodo, lugares: cfgLugares(cfg), enPC: enPC })),
             showTutos && (() => {
                 const pr = progresoTutos(tutosVistos, svc);
                 const abrir = k => {
