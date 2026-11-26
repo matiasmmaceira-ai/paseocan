@@ -1466,6 +1466,42 @@ function asignarRecorrido(dogs, paseos, { dogId, planId, gid, modo, dow, fecha, 
         return { dogs, paseos };
     return { dogs: ds2, paseos: reubicarSegunPlan(paseos, dogId, planNuevo, H) };
 }
+// ── UN PERRO NO SALE DOS VECES EN EL MISMO RECORRIDO (26/11/2026, Matías: "¿si tildás los dos planes en un
+// recorrido y se superponen días?") ──
+// Dos planes del mismo perro con el mismo recorrido el mismo día = dos paseos en la misma salida: el recorrido
+// contaba un perro de más y "Completar" marcaba los dos (por paseo: se cobraba dos veces ese día). Regla única
+// para Perros del recorrido, "Sale con" (ficha y alta) y Ubicar: no se deja armar.
+// recDow: el recorrido de un plan para un día de la semana (recorridoDia manda; si no, gid).
+function recDow(pl, dw) { const rd = pl && pl.recorridoDia; const k = String(dw); if (rd && Object.prototype.hasOwnProperty.call(rd, k))
+    return rd[k] || null; return (pl && pl.gid) || null; }
+// diasDobleRecorrido(planes, cand, hoy): días de la semana en que `cand` (el plan como quedaría) sale con el mismo
+// recorrido que OTRO plan grupal vigente del perro, en fechas que se cruzan (una tarifa vieja con "hasta" y la
+// nueva con "desde" no se cruzan). [] = está bien.
+function diasDobleRecorrido(planes, cand, hoy) {
+    const H = hoy || td();
+    if (!cand || cand.suelto || esIndividual(cand) || (cand.hasta && cand.hasta < H))
+        return [];
+    const out = new Set();
+    (planes || []).forEach(o => {
+        if (!o || o.id === cand.id || o.suelto || esIndividual(o) || (o.hasta && o.hasta < H))
+            return;
+        if (!((o.desde || "") <= (cand.hasta || "9999-12-31") && (cand.desde || "") <= (o.hasta || "9999-12-31")))
+            return;
+        const od = (o.schedule || []).map(Number);
+        (cand.schedule || []).map(Number).forEach(dw => { if (!od.includes(dw))
+            return; const r = recDow(cand, dw); if (r && r === recDow(o, dw))
+            out.add(dw); });
+    });
+    return [...out].sort((a, b) => a - b);
+}
+const DIAS_CORTOS_PL = ["Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"];
+function diasTxtY(ds) { const xs = (ds || []).map(d => DIAS_CORTOS_PL[d]); return xs.length < 2 ? (xs[0] || "") : (xs.slice(0, -1).join(", ") + " y " + xs[xs.length - 1]); }
+// planesConDoble: el primer plan del perro que sale dos veces con un recorrido, con sus días (o null).
+function planesConDoble(planes, hoy) { for (const pl of (planes || [])) {
+    const d = diasDobleRecorrido(planes, pl, hoy);
+    if (d.length)
+        return { plan: pl, dias: d };
+} return null; }
 // ── COBRADO NETO — funciones canonicas (fuente unica del "cuanto cobre") ──────
 // El pa se guarda BRUTO; el descuento por cancelacion (p.desc) se aplica aparte.
 // Estas funciones son el UNICO lugar que combina pa - descuento. Todo sitio que
@@ -5879,9 +5915,14 @@ function avisosDeLaApp({ servicios, backup, shareMsg, primeros, nube, nubeCf, es
 // Solo lo que el paseador nota (nunca lo interno). La más nueva va PRIMERO. Una versión sin nada visible no se agrega.
 // En el celular se guarda la última vista (pc_novedades_visto, no viaja: cada aparato la ve una vez).
 const NOVEDADES = [
+    { ver: "2026-11-26a", fecha: "26/11/2026", items: [
+            "En la Agenda, \"Crear o editar recorridos\" ahora es un botón ancho debajo de los servicios.",
+            "Al armar el plan de un perro, en \"Sale con\" podés elegir \"Recorrido nuevo\": se crea ya armado y queda elegido.",
+            "En cada recorrido, \"🐾 Perros\" ahora te deja tildar qué perros salen con él (y al crear uno se abre directo).",
+        ] },
     { ver: "2026-11-25c", fecha: "25/11/2026", items: [
             "En la Agenda, el botón \"Paseo\" ahora te pregunta qué cargás: un plan fijo (grupal o individual, qué días, cuánto paga y desde cuándo, igual que en la ficha del perro) o un paseo suelto.",
-            "\"Recorridos\" ahora está a la vista, arriba a la derecha del cuadro del día.",
+            "\"Recorridos\" ahora está a la vista en la Agenda.",
         ] },
     { ver: "2026-11-25a", fecha: "25/11/2026", items: [
             "Cada perro tiene su plan: grupal (sale con otros perros) o individual (lo buscás a una hora y lo devolvés), qué días sale, cuánto te paga y cómo. Para cargarlo ya no hace falta elegir un grupo. Los individuales tienen su propia ficha en la Agenda.",
@@ -5895,12 +5936,19 @@ const NOVEDADES = [
 // Qué mostrar: usuario nuevo (sin clientes y nunca vio nada) → nada; el que se actualiza → lo que no vio.
 // Nunca vio ninguna (se actualiza desde antes de que existieran): ve las del ÚLTIMO DÍA con novedades (25/11/2026:
 // ese día salieron la 25a y la 25c; con solo la última se perdía lo grande de la 25a).
+// 26/11/2026: el que nunca cerró la tarjeta ve las de la ÚLTIMA SEMANA (antes solo las del último día: con la
+// 26a, el que venía de antes de la 25a se perdía el cambio grande de planes y recorridos). Lo más viejo, no.
+const novDia = f => { const m = String(f || "").match(/^(\d\d)\/(\d\d)\/(\d{4})$/); return m ? Date.UTC(+m[3], +m[2] - 1, +m[1]) / 864e5 : 0; };
 function novedadesPendientes(visto, tieneDatos, lista) {
     const L = lista || NOVEDADES;
     if (!L.length)
         return [];
-    if (visto == null)
-        return tieneDatos ? L.filter(n => n.fecha === L[0].fecha) : [];
+    if (visto == null) {
+        if (!tieneDatos)
+            return [];
+        const d0 = novDia(L[0].fecha);
+        return L.filter(n => d0 - novDia(n.fecha) < 7);
+    }
     return L.filter(n => n.ver > visto);
 }
 // ── AVISOS QUE SE PUEDEN SACAR + CÍRCULO ROJO (25/11/2026, Matías y usuarios: "los pasos pendientes parecen obligar";
@@ -11460,6 +11508,9 @@ function puedeAnadirPerro(nDog, para, svc) {
             return { ok: false, falta: "Falta el plan del paseo: días, precio y cómo te paga." };
         if ((d.groups || []).some(grpSinPrecio))
             return { ok: false, falta: "Falta el precio del plan. Cargá cuánto paga: sin eso la app no sabe cuánto cobrarle." };
+        const dbl = planesConDoble(d.groups);
+        if (dbl)
+            return { ok: false, falta: "Dos planes salen con el mismo recorrido los " + diasTxtY(dbl.dias) + ": cambiá uno en \"Sale con\"." };
     }
     return { ok: true, falta: null };
 }
@@ -11568,7 +11619,7 @@ const COBRO_LINEA = [["sem_fin", "por semana · al final"], ["sem_ini", "por sem
 function opcionCobroLinea(grp) { const op = opcionCobro(grp); return op === "mes" ? ((ensureGrupo(grp).billingTiming === "vencido") ? "mes_fin" : "mes_ini") : op; }
 function aplicarCobroLinea(grp, v) { if (v === "mes_ini" || v === "mes_fin")
     return Object.assign(Object.assign({}, aplicarOpcionCobro(grp, "mes")), { billingTiming: v === "mes_ini" ? "adelantado" : "vencido" }); return aplicarOpcionCobro(grp, v); }
-function GrpEdLinea({ grp, globalGroups, onChange, onRemove, foco, alta }) {
+function GrpEdLinea({ grp, globalGroups, onChange, onRemove, foco, alta, onNuevoRecorrido, planes }) {
     const [mas, setMas] = useState(false);
     const ref = useRef(null);
     // 29/10/2026 (Matías: al entrar se abría el teclado): solo lleva la pantalla al grupo marcado; el
@@ -11641,9 +11692,21 @@ function GrpEdLinea({ grp, globalGroups, onChange, onRemove, foco, alta }) {
                 React.createElement("label", { style: LBL }, "Dura (min)"),
                 React.createElement("input", { className: "pc-plan-dura", type: "number", inputMode: "numeric", value: grp.dura || "", placeholder: "ej: 45", onChange: e => onChange(Object.assign(Object.assign({}, grp), { dura: numInt(e.target.value) })), style: Object.assign(Object.assign({}, INP), { padding: "8px 6px" }) })))) : (React.createElement("div", { className: "pc-plan-sale", style: { display: "flex", alignItems: "center", gap: 8, marginTop: 8 } },
             React.createElement("label", { style: Object.assign(Object.assign({}, LBL), { margin: 0, flexShrink: 0 }) }, "Sale con"),
-            React.createElement("select", { className: "pc-plan-recorrido", value: grp.gid || "", onChange: e => { const v = e.target.value || null; const n = Object.assign(Object.assign({}, grp), { gid: v }); delete n.recorridoDia; onChange(n); }, style: Object.assign(Object.assign({}, INP), { flex: 1, minWidth: 0, padding: "8px 6px", fontSize: 13, color: grp.gid ? C.txt : C.amb }) },
+            React.createElement("select", { className: "pc-plan-recorrido", value: grp.gid || "", onChange: e => { let v = e.target.value || null; if (v === "__nuevo__") {
+                    v = onNuevoRecorrido ? onNuevoRecorrido() : null;
+                    if (!v)
+                        return;
+                } const n = Object.assign(Object.assign({}, grp), { gid: v }); delete n.recorridoDia; onChange(n); }, style: Object.assign(Object.assign({}, INP), { flex: 1, minWidth: 0, padding: "8px 6px", fontSize: 13, color: grp.gid ? C.txt : C.amb }) },
                 React.createElement("option", { value: "" }, "Sin recorrido"),
-                (globalGroups || []).map(g => React.createElement("option", { key: g.id, value: g.id }, g.name + (g.startTime ? " · " + g.startTime : "")))))),
+                (globalGroups || []).map(g => React.createElement("option", { key: g.id, value: g.id }, g.name + (g.startTime ? " · " + g.startTime : ""))),
+                onNuevoRecorrido && React.createElement("option", { value: "__nuevo__" }, "＋ Recorrido nuevo")))),
+        !esIndividual(grp) && (() => {
+            const dd = diasDobleRecorrido(planes, grp);
+            if (!dd.length)
+                return null;
+            const g1 = (globalGroups || []).find(x => x.id === recDow(grp, dd[0]));
+            return React.createElement("div", { className: "pc-plan-doble", style: { fontSize: 12, color: C.amb, fontWeight: 700, marginTop: 6, lineHeight: 1.4 } }, "Los " + diasTxtY(dd) + " ya sale con " + (g1 ? g1.name : "ese recorrido") + " por su otro plan: elegí otro recorrido o Sin recorrido.");
+        })(),
         !esIndividual(grp) && grp.recorridoDia && Object.keys(grp.recorridoDia).length > 0 && React.createElement("div", { style: { fontSize: 12, color: C.mut, marginTop: 4 } }, Object.entries(grp.recorridoDia).map(([dw, gid]) => { const g = (globalGroups || []).find(x => x.id === gid); return "los " + DIAS_LARGOS_PL[Number(dw)] + " con " + (g ? g.name : "ninguno"); }).join(" · ") + " (cambiar el de arriba lo borra)"),
         React.createElement("div", { style: { marginTop: 8 } }, val === "paseo" ? (React.createElement("div", { style: { display: "flex", gap: 6 } },
             React.createElement("div", { style: { position: "relative", flex: "0 0 50%", minWidth: 0 } },
@@ -11675,7 +11738,7 @@ function DogGrpsEd({ draft, set, gg, setGG, cfg, embebido, abierto, habitual, en
         enLinea && !sinTitulo && React.createElement("div", { style: { fontSize: 12, fontWeight: 800, color: C.grn, letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 6 } }, gruposReales(draft).filter(g => !g.hasta).length > 1 ? "🐾 Planes" : "🐾 Plan"),
         React.createElement("div", { style: { marginTop: 10 } },
             !gruposReales(draft).length && React.createElement("div", { style: { fontSize: 13, color: C.mut, textAlign: "center", padding: "8px 0" } }, "Sin plan de paseos"),
-            (draft.groups || []).map((g, i) => [g, i]).sort((x, y) => enLinea ? ((x[0] && x[0].hasta ? 1 : 0) - (y[0] && y[0].hasta ? 1 : 0)) : 0).map(([g, i]) => g && g.suelto ? null : enLinea ? (React.createElement(GrpEdLinea, { key: g.id, grp: g, globalGroups: gg, alta: !!abierto, foco: (!!foco && foco === g.id) || g.id === recien, onChange: upd => { const gs = [...(draft.groups || [])]; gs[i] = upd; set(d => (Object.assign(Object.assign({}, d), { groups: gs }))); }, onRemove: () => set(d => (Object.assign(Object.assign({}, d), { groups: quitarDeGrupo(d.groups, g.id, paseos, d.id, td()) }))) })) : (React.createElement(GrpEd, { key: g.id, grp: g, globalGroups: gg, alta: !!abierto, abiertoIni: g.id === recien, habitual: habitual, onChange: upd => { const gs = [...(draft.groups || [])]; gs[i] = upd; set(d => (Object.assign(Object.assign({}, d), { groups: gs }))); }, onRemove: () => set(d => (Object.assign(Object.assign({}, d), { groups: quitarDeGrupo(d.groups, g.id, paseos, d.id, td()) }))) }))),
+            (draft.groups || []).map((g, i) => [g, i]).sort((x, y) => enLinea ? ((x[0] && x[0].hasta ? 1 : 0) - (y[0] && y[0].hasta ? 1 : 0)) : 0).map(([g, i]) => g && g.suelto ? null : enLinea ? (React.createElement(GrpEdLinea, { key: g.id, grp: g, planes: draft.groups, globalGroups: gg, alta: !!abierto, foco: (!!foco && foco === g.id) || g.id === recien, onNuevoRecorrido: setGG ? () => { const r = armarGrupo({}, gg, cfg); setGG(xs => [...(xs || []), r]); return r.id; } : undefined, onChange: upd => { const gs = [...(draft.groups || [])]; gs[i] = upd; set(d => (Object.assign(Object.assign({}, d), { groups: gs }))); }, onRemove: () => set(d => (Object.assign(Object.assign({}, d), { groups: quitarDeGrupo(d.groups, g.id, paseos, d.id, td()) }))) })) : (React.createElement(GrpEd, { key: g.id, grp: g, globalGroups: gg, alta: !!abierto, abiertoIni: g.id === recien, habitual: habitual, onChange: upd => { const gs = [...(draft.groups || [])]; gs[i] = upd; set(d => (Object.assign(Object.assign({}, d), { groups: gs }))); }, onRemove: () => set(d => (Object.assign(Object.assign({}, d), { groups: quitarDeGrupo(d.groups, g.id, paseos, d.id, td()) }))) }))),
             React.createElement("button", { id: "pc-ep-mas-plan", onClick: addPlan, style: { width: "100%", padding: "11px 8px", borderRadius: 12, border: `1.5px dashed ${C.grn}88`, background: "transparent", color: C.grn, fontWeight: 700, fontSize: 13.5, cursor: "pointer", fontFamily: "inherit" } }, n ? "+ Agregar otro plan" : "+ Plan de paseos"))));
     if (embebido)
         return cuerpo;
@@ -12735,12 +12798,11 @@ function Agenda({ svc, avisosApp, avisosBase, pendientes, pide, setWaTpl, partes
                 React.createElement("div", { style: { fontSize: 12, fontWeight: 800, color: C.mut, marginBottom: 6 } }, "＋ Cargar"),
                 React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(" + Math.min(normScale(cfg && cfg.textScale) >= 1.3 ? 2 : 4, 1 + (svc ? (svc.est ? 1 : 0) + (svc.cla ? 1 : 0) + (svc.ven ? 1 : 0) : 3)) + ",minmax(0,1fr))", gap: 6 } }, [["paseo", "🐾", "Paseo", C.grn, () => onAdd(sel)], ["estadia", "🏠", "Estadía", C.amb, () => onAddEstadia && onAddEstadia(sel)], ["clase", "🎓", "Clase", C.blu, () => onAddClase && onAddClase(sel)], ["venta", "🛍️", "Venta", colTipo.ventas, () => irDetalle("ventas", "v")]].filter(([k]) => !svc || (k === "estadia" ? svc.est : k === "clase" ? svc.cla : k === "venta" ? svc.ven : true)).map(([k, ic, t, col, fn]) => (React.createElement("button", { key: k, className: "pc-ag-cargar", "data-k": k, onClick: fn, style: { minWidth: 0, padding: "8px 2px", borderRadius: 12, border: `1.5px solid ${col}66`, background: C.cl, cursor: "pointer", textAlign: "center" } },
                     React.createElement("span", { style: { display: "block", fontSize: 20, lineHeight: 1.2 } }, ic),
-                    React.createElement("span", { style: { display: "block", fontSize: 12, fontWeight: 800, color: C.txt, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, t)))))),
+                    React.createElement("span", { style: { display: "block", fontSize: 12, fontWeight: 800, color: C.txt, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, t))))),
+                React.createElement("button", { id: "pc-ag-grupos", onClick: () => { if ((gg || []).length === 0)
+                        setNuevoGrupo({ name: "", startTime: "08:00" }); setGruposOpen(true); }, style: { width: "100%", marginTop: 8, padding: "10px 12px", borderRadius: 12, border: `1.5px solid ${C.grn}77`, background: "transparent", color: C.grn, fontSize: 13.5, fontWeight: 800, cursor: "pointer", fontFamily: "inherit" } }, (gg || []).length ? "🧭 Crear o editar recorridos" : "🧭 Crear tu primer recorrido")),
             React.createElement("div", { id: "pc-ag-hoy", style: Object.assign(Object.assign({}, CARD), { padding: "12px 14px", marginBottom: 12 }) },
-                React.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 4 } },
-                    React.createElement("div", { style: { fontWeight: 800, fontSize: 15, color: C.txt, minWidth: 0 } }, sel === T ? "Hoy" : (sel === addDays(T, 1) ? "Mañana" : fechaTxt)),
-                    React.createElement("button", { id: "pc-ag-grupos", onClick: () => { if ((gg || []).length === 0)
-                            setNuevoGrupo({ name: "", startTime: "08:00" }); setGruposOpen(true); }, style: Object.assign(Object.assign({}, BR("secundario", false)), { display: "inline-flex", alignItems: "center", gap: 5, padding: "6px 11px", fontSize: 12.5, borderRadius: 20, flexShrink: 0, borderColor: C.grn + "77", color: C.grn }) }, "🧭 Recorridos")),
+                React.createElement("div", { style: { fontWeight: 800, fontSize: 15, color: C.txt, marginBottom: 4 } }, sel === T ? "Hoy" : (sel === addDays(T, 1) ? "Mañana" : fechaTxt)),
                 itemsDia.length === 0 && React.createElement("div", { style: { fontSize: 13, color: C.mut, padding: "6px 0" } }, "No hay nada cargado este día."),
                 itemsDia.map(x => fila(Object.assign(Object.assign({}, x), { cuerpo: (React.createElement(React.Fragment, null,
                         React.createElement("div", { style: { fontWeight: 800, fontSize: 14, color: x.estado === "cancelado" ? C.mut : C.txt, textDecoration: x.estado === "cancelado" && x.tipo !== "ausentes" ? "line-through" : "none" } }, icTipo[x.tipo] + " " + x.titulo),
@@ -12863,6 +12925,7 @@ function Agenda({ svc, avisosApp, avisosBase, pendientes, pide, setWaTpl, partes
                 const g = { id: "gg_" + uid(), name, startTime: nuevoGrupo.startTime || "08:00", origin: "", destination: "", minPorKm: (cfg && cfg.minPorKm) || 15 };
                 setGG(gs => [...(gs || []), g]);
                 setNuevoGrupo(null);
+                setDiagGrupo(g.id);
             };
             return (React.createElement("div", { onClick: () => { setGruposOpen(false); setNuevoGrupo(null); }, style: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "flex-end", zIndex: 150 } },
                 React.createElement("div", { onClick: e => e.stopPropagation(), style: { width: "100%", maxWidth: 430, margin: "0 auto", background: C.card, borderTopLeftRadius: 20, borderTopRightRadius: 20, border: `1px solid ${C.bdr}`, padding: 18, paddingBottom: 28, maxHeight: "80vh", overflowY: "auto", position: "relative" } },
@@ -12877,7 +12940,7 @@ function Agenda({ svc, avisosApp, avisosBase, pendientes, pide, setWaTpl, partes
                         React.createElement("div", { style: { marginBottom: 12 } },
                             React.createElement("label", { style: LBL }, "Hora de salida"),
                             React.createElement("input", { type: "time", value: nuevoGrupo.startTime || "08:00", onChange: e => setNuevoGrupo(g => (Object.assign(Object.assign({}, g), { startTime: e.target.value }))), style: INP })),
-                        React.createElement("div", { style: { fontSize: 12, color: C.mut, marginBottom: 12 } }, "Los días y los perros se asignan después, moviéndolos desde su ficha."),
+                        React.createElement("div", { style: { fontSize: 12, color: C.mut, marginBottom: 12 } }, "Después de crearlo elegís qué perros salen con él."),
                         React.createElement("div", { style: { display: "flex", gap: 8 } },
                             (gg || []).length > 0 && React.createElement("button", { onClick: () => setNuevoGrupo(null), style: Object.assign(Object.assign({}, BR("secundario", false)), { flex: 1, fontSize: 13 }) }, "Cancelar"),
                             React.createElement("button", { onClick: crear, style: Object.assign(Object.assign({}, BR("primario", false)), { flex: 2, fontSize: 13 }) }, "Crear")))),
@@ -12897,7 +12960,7 @@ function Agenda({ svc, avisosApp, avisosBase, pendientes, pide, setWaTpl, partes
                             React.createElement("div", { style: { fontSize: 16, color: C.mut, flexShrink: 0 } }, ">")),
                         React.createElement("div", { style: { display: "flex", gap: 6, marginTop: 10 } },
                             React.createElement("button", { onClick: e => { e.stopPropagation(); setEditPuntosFijos(Object.assign({}, g)); }, style: { flex: 1, minWidth: 0, background: "transparent", border: `1px solid ${C.bdr}`, color: C.mut, fontSize: 12, fontWeight: 700, padding: "7px 4px", borderRadius: 8, whiteSpace: "nowrap" } }, "⚙️ Nombre"),
-                            React.createElement("button", { onClick: e => { e.stopPropagation(); setDiagGrupo(g.id); }, style: { flex: 1, minWidth: 0, background: "transparent", border: `1px solid ${C.bdr}`, color: C.blu, fontSize: 12, fontWeight: 700, padding: "7px 4px", borderRadius: 8, whiteSpace: "nowrap" } }, "🔍 Perros"),
+                            React.createElement("button", { onClick: e => { e.stopPropagation(); setDiagGrupo(g.id); }, style: { flex: 1, minWidth: 0, background: "transparent", border: `1px solid ${C.bdr}`, color: C.blu, fontSize: 12, fontWeight: 700, padding: "7px 4px", borderRadius: 8, whiteSpace: "nowrap" } }, "🐾 Perros"),
                             React.createElement("button", { onClick: e => { e.stopPropagation(); setConfDeleteGrupo(g.id); }, style: { flex: 1, minWidth: 0, background: "transparent", border: `1px solid ${C.bdr}`, color: "#fca5a5", fontSize: 12, fontWeight: 700, padding: "7px 4px", borderRadius: 8, whiteSpace: "nowrap" } }, "🗑️ Eliminar"))))))));
         })(),
         diagGrupo && (() => {
@@ -12905,27 +12968,66 @@ function Agenda({ svc, avisosApp, avisosBase, pendientes, pide, setWaTpl, partes
             if (!g)
                 return null;
             const DOWLBL = ["Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"];
-            const perros = mDogs.map(d => { const gr = gruposReales(d).find(x => x.gid === diagGrupo); return gr ? { dog: d, gr } : null; }).filter(Boolean);
+            // 26/11/2026 (Matías: "¿y dentro podemos seleccionar los perros que queremos que estén en el recorrido?"):
+            // antes era un diagnóstico de solo lectura. Ahora lista TODOS los planes grupales vigentes con su tilde:
+            // tildar = sale con este recorrido todos sus días (si estaba en otro, pasa a este); destildar = sin recorrido.
+            // Usa asignarRecorrido (modo "todos"): solo cambia el recorrido; nunca precio, días, cobros ni paseos pasados.
+            // Los "por única vez" (plan sin días, de antes) siguen con su "Quitar".
+            const filas = [];
+            mDogs.forEach(d => gruposReales(d).forEach(gr => {
+                if (gr.hasta || esIndividual(gr))
+                    return;
+                const sinDias = !(gr.schedule || []).length;
+                if (sinDias && gr.gid !== diagGrupo)
+                    return;
+                const en = gr.gid === diagGrupo;
+                const choca = diasDobleRecorrido(d.groups, en ? gr : (() => { const n = Object.assign(Object.assign({}, gr), { gid: diagGrupo }); delete n.recorridoDia; return n; })());
+                filas.push({ dog: d, gr, sinDias, en, choca });
+            }));
+            const nombreRec = gid => { const x = (gg || []).find(y => y.id === gid); return x ? x.name : null; };
+            const orden = f => f.en ? 0 : !f.gr.gid ? 1 : 2;
+            filas.sort((a, b) => orden(a) - orden(b) || String(a.dog.name).localeCompare(String(b.dog.name)));
+            const nEn = filas.filter(f => f.en).length;
+            const tildar = (f) => {
+                if (!f.en && f.choca.length)
+                    return;
+                const args = { dogId: f.dog.id, planId: f.gr.id, gid: f.en ? null : diagGrupo, modo: "todos", hoy: td() };
+                setDogs(ds => asignarRecorrido(ds, [], args).dogs);
+                setPaseos(ps => asignarRecorrido(dogs, ps, args).paseos);
+            };
             return (React.createElement("div", { onClick: () => setDiagGrupo(null), style: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "flex-end", zIndex: 160 } },
-                React.createElement("div", { onClick: e => e.stopPropagation(), style: { width: "100%", maxWidth: 430, margin: "0 auto", background: C.card, borderTopLeftRadius: 20, borderTopRightRadius: 20, border: `1px solid ${C.bdr}`, padding: 18, paddingBottom: 28, maxHeight: "80vh", overflowY: "auto", boxSizing: "border-box", position: "relative" } },
+                React.createElement("div", { id: "pc-rec-perros", onClick: e => e.stopPropagation(), style: { width: "100%", maxWidth: 430, margin: "0 auto", background: C.card, borderTopLeftRadius: 20, borderTopRightRadius: 20, border: `1px solid ${C.bdr}`, padding: 18, paddingBottom: 28, maxHeight: "80vh", overflowY: "auto", boxSizing: "border-box", position: "relative" } },
                     React.createElement(XCerrar, { onClick: () => setDiagGrupo(null) }),
                     React.createElement("div", { style: { width: 38, height: 4, background: C.bdr, borderRadius: 4, margin: "0 auto 14px" } }),
-                    React.createElement("div", { style: { fontWeight: 800, fontSize: 16, color: C.txt, marginBottom: 4, paddingRight: 40 } }, "Diagnóstico - " + g.name),
-                    React.createElement("div", { style: { fontSize: 12, color: C.mut, marginBottom: 14 } }, perros.length + " perro" + (perros.length !== 1 ? "s" : "") + " contados en total (habituales + por única vez)."),
-                    perros.length === 0 && React.createElement("div", { style: { fontSize: 13, color: C.mut, fontStyle: "italic", textAlign: "center", padding: "14px 0" } }, "Ningún perro asignado todavía."),
-                    perros.map(({ dog, gr }) => {
-                        const dias = gr.schedule || [];
+                    React.createElement("div", { style: { fontWeight: 800, fontSize: 16, color: C.txt, marginBottom: 4, paddingRight: 40 } }, "Perros de " + g.name),
+                    React.createElement("div", { style: { fontSize: 12, color: C.mut, marginBottom: 14, lineHeight: 1.45 } }, "Tildá los que salen con este recorrido (todos sus días). Si estaba en otro, pasa a este. No cambia lo que pagan."),
+                    filas.length === 0 && React.createElement("div", { style: { fontSize: 13, color: C.mut, fontStyle: "italic", textAlign: "center", padding: "14px 0" } }, "Todavía no hay perros con plan grupal."),
+                    filas.map(f => {
+                        const { dog, gr, sinDias, en, choca } = f;
+                        const bloq = !en && choca.length > 0;
                         const cl = clients.find(c => c.id === dog.cid);
-                        const pendientes = (paseos || []).filter(p => p.dogId === dog.id && p.gid === diagGrupo && p.status === "programado").length;
-                        return (React.createElement("div", { key: dog.id, style: { display: "flex", alignItems: "center", gap: 10, background: C.cl, border: `1px solid ${C.bdr}`, borderRadius: 12, padding: "10px 12px", marginBottom: 8 } },
-                            React.createElement("div", { style: { width: 30, height: 30, borderRadius: "50%", background: C.cl, border: `1px solid ${C.bdr}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 800, color: C.mut, flexShrink: 0 } }, dog.name.charAt(0).toUpperCase()),
+                        const otro = !en && gr.gid ? nombreRec(gr.gid) : null;
+                        const dias = (gr.schedule || []).map(dw => DOWLBL[dw]).join(" · ");
+                        const sub = [cl && cl.name, dias].filter(Boolean).join(" · ");
+                        if (sinDias) {
+                            const pendientes = (paseos || []).filter(p => p.dogId === dog.id && p.gid === diagGrupo && p.status === "programado").length;
+                            return (React.createElement("div", { key: gr.id, style: { display: "flex", alignItems: "center", gap: 10, background: C.cl, border: `1px solid ${C.bdr}`, borderRadius: 12, padding: "10px 12px", marginBottom: 8 } },
+                                React.createElement("div", { style: { flex: 1, minWidth: 0 } },
+                                    React.createElement("div", { style: { fontWeight: 800, fontSize: 14, color: C.txt } }, dog.name),
+                                    React.createElement("div", { style: { fontSize: 12, color: C.amb } }, "Por única vez")),
+                                React.createElement("button", { onClick: () => setConfQuitarMembership({ dogId: dog.id, gid: diagGrupo, dname: dog.name, gname: g.name, pendientes }), style: { fontSize: 12, background: "transparent", border: `1px solid ${C.bdr}`, color: C.mut, fontWeight: 700, padding: "5px 10px", borderRadius: 8 } }, "Quitar")));
+                        }
+                        return (React.createElement("div", { key: gr.id, className: "pc-rec-perro", "data-dog": dog.id, "data-plan": gr.id, role: "checkbox", "aria-checked": en, "aria-disabled": bloq, onClick: () => tildar(f), style: { display: "flex", alignItems: "center", gap: 10, background: en ? C.grn + "14" : C.cl, border: `1.5px solid ${en ? C.grn : C.bdr}`, borderRadius: 12, padding: "10px 12px", marginBottom: 8, cursor: bloq ? "not-allowed" : "pointer", opacity: bloq ? 0.6 : 1 } },
                             React.createElement("div", { style: { flex: 1, minWidth: 0 } },
-                                React.createElement("div", { style: { fontWeight: 800, fontSize: 13, color: C.txt } }, dog.name),
-                                React.createElement("div", { style: { fontSize: 12, color: C.mut } }, (cl === null || cl === void 0 ? void 0 : cl.name) || "")),
-                            dias.length > 0 ? (React.createElement("span", { style: { fontSize: 12, background: C.grn + "22", color: C.grn, fontWeight: 700, padding: "3px 8px", borderRadius: 20 } }, dias.map(dw => DOWLBL[dw]).join(" · "))) : (React.createElement(React.Fragment, null,
-                                React.createElement("span", { style: { fontSize: 12, background: C.amb + "22", color: C.amb, fontWeight: 700, padding: "3px 8px", borderRadius: 20 } }, "Por única vez"),
-                                React.createElement("button", { onClick: () => setConfQuitarMembership({ dogId: dog.id, gid: diagGrupo, dname: dog.name, gname: g.name, pendientes }), style: { fontSize: 12, background: "transparent", border: `1px solid ${C.bdr}`, color: C.mut, fontWeight: 700, padding: "3px 8px", borderRadius: 8 } }, "Quitar")))));
-                    }))));
+                                React.createElement("div", { style: { fontWeight: 800, fontSize: 14, color: en ? C.grn : C.txt } }, dog.name + (gr.titulo ? " (" + gr.titulo + ")" : "")),
+                                React.createElement("div", { style: { fontSize: 12, color: C.mut } }, sub),
+                                bloq ? React.createElement("div", { className: "pc-rec-perro-choca", style: { fontSize: 12, color: C.amb, fontWeight: 700, marginTop: 2 } }, "Los " + diasTxtY(choca) + " ya sale con este recorrido por su otro plan")
+                                    : !en && React.createElement("div", { style: { fontSize: 12, color: otro ? C.blu : C.amb, fontWeight: 700, marginTop: 2 } }, otro ? ("Ahora sale con " + otro) : "Sin recorrido"),
+                                en && choca.length > 0 && React.createElement("div", { className: "pc-rec-perro-choca", style: { fontSize: 12, color: C.amb, fontWeight: 700, marginTop: 2 } }, "Sale dos veces los " + diasTxtY(choca) + " (otro plan también va acá): destildá uno"),
+                                en && gr.recorridoDia && Object.keys(gr.recorridoDia).length > 0 && React.createElement("div", { style: { fontSize: 12, color: C.mut, marginTop: 2 } }, "Algunos días sale con otro")),
+                            React.createElement("span", { "aria-hidden": "true", style: { flexShrink: 0, width: 24, height: 24, borderRadius: 12, border: `2px solid ${en ? C.grn : C.mut}`, background: en ? C.grn : "transparent", color: C.bg, fontWeight: 900, fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center" } }, en ? "✓" : "")));
+                    }),
+                    React.createElement("button", { id: "pc-rec-perros-listo", onClick: () => setDiagGrupo(null), style: Object.assign(Object.assign({}, Btn(C.grn, "#0f1a14")), { width: "100%", marginTop: 6 }) }, "Listo (" + nEn + (nEn === 1 ? " perro" : " perros") + ")"))));
         })(),
         confQuitarMembership && (React.createElement(Confirm, { title: "Quitar " + confQuitarMembership.dname + " de " + confQuitarMembership.gname + "?", sub: confQuitarMembership.pendientes > 0 ? ("Tiene " + confQuitarMembership.pendientes + " paseo(s) programado(s) en este recorrido: quedan sin recorrido. La plata no cambia.") : "No tiene paseos programados en este recorrido.", danger: true, onOk: () => {
                 const { dogId, gid } = confQuitarMembership;
@@ -13207,6 +13309,15 @@ function Agenda({ svc, avisosApp, avisosBase, pendientes, pide, setWaTpl, partes
                             React.createElement("span", { style: { fontSize: 12.5, color: C.mut } }, gps.length + " perro" + (gps.length !== 1 ? "s" : "")))),
                     variosGrupos && !abierto && pend.length > 0 && React.createElement("span", { style: { fontSize: 12, fontWeight: 700, color: C.amb } }, pend.length + " pendiente" + (pend.length !== 1 ? "s" : "")),
                     variosGrupos && !abierto && done && React.createElement("span", { style: { fontSize: 12, fontWeight: 700, color: C.grn } }, "Completado")),
+                gg2 && (() => {
+                    const vis = {}, dup = [];
+                    gps.filter(p => p.status !== "cancelado").forEach(p => { if (vis[p.dogId] && !dup.includes(p.dogId))
+                        dup.push(p.dogId); vis[p.dogId] = 1; });
+                    if (!dup.length)
+                        return null;
+                    const nom = dup.map(id => { const d = dogs.find(x => x.id === id); return d ? d.name : "Un perro"; }).join(", ");
+                    return React.createElement("div", { className: "pc-ag-rec-doble", style: { fontSize: 12.5, color: C.amb, fontWeight: 700, background: C.amb + "11", border: `1px solid ${C.amb}44`, borderRadius: 10, padding: "8px 10px", marginBottom: 10, lineHeight: 1.4 } }, nom + (dup.length === 1 ? " está" : " están") + " dos veces en este recorrido (dos planes el mismo día). En 🧭 Crear o editar recorridos > 🐾 Perros, destildá uno.");
+                })(),
                 !abierto ? null : (React.createElement(React.Fragment, null,
                     gg2 && (() => {
                         const oa = (tl === null || tl === void 0 ? void 0 : tl.orderedActive) || [];
@@ -14140,7 +14251,25 @@ function Agenda({ svc, avisosApp, avisosBase, pendientes, pide, setWaTpl, partes
             const diasPlan = (plan.schedule || []).map(Number).sort((a, b) => a - b).map(x => DAYS[x]).join(", ");
             const nuevo = ubicar.nuevo;
             const elegido = nuevo ? null : gg.find(g => g.id === ubicar.gid);
-            const listo = !!(nuevo ? String(nuevo.name || "").trim() : elegido);
+            // 26/11/2026: no deja ubicarlo donde su otro plan ya sale ese día (saldría dos veces en el mismo recorrido).
+            const chocaU = (() => {
+                if (nuevo || !elegido)
+                    return [];
+                const g = elegido.id;
+                if (ubicar.modo === "fecha")
+                    return (paseos || []).some(p => p.dogId === dog.id && p.fecha === ubicar.fecha && p.dgid !== plan.id && p.status !== "cancelado" && (p.gid || null) === g) ? [dw] : [];
+                let c;
+                if (ubicar.modo === "dia") {
+                    c = Object.assign(Object.assign({}, plan), { recorridoDia: Object.assign(Object.assign({}, (plan.recorridoDia || {})), { [String(dw)]: g }) });
+                }
+                else {
+                    c = Object.assign(Object.assign({}, plan), { gid: g });
+                    delete c.recorridoDia;
+                }
+                const d = diasDobleRecorrido(dog.groups, c);
+                return ubicar.modo === "dia" ? d.filter(x => x === dw) : d;
+            })();
+            const listo = !!(nuevo ? String(nuevo.name || "").trim() : elegido) && !chocaU.length;
             const confirmar = () => {
                 let gid = ubicar.gid;
                 if (nuevo) {
@@ -14182,7 +14311,8 @@ function Agenda({ svc, avisosApp, avisosBase, pendientes, pide, setWaTpl, partes
                             opt(ubicar.modo === "todos", "Todos sus días", "queda fijo", () => setUbicar(u => (Object.assign(Object.assign({}, u), { modo: "todos" }))), "pc-ubicar-modo"),
                             (plan.schedule || []).length > 1 && opt(ubicar.modo === "dia", "Solo los " + DLARGO[dw].toLowerCase(), "queda fijo", () => setUbicar(u => (Object.assign(Object.assign({}, u), { modo: "dia" }))), "pc-ubicar-modo"),
                             opt(ubicar.modo === "fecha", ubicar.fecha === T ? "Solo hoy" : "Solo el " + DLARGO[dw].toLowerCase() + " " + dd.getDate(), "una vez", () => setUbicar(u => (Object.assign(Object.assign({}, u), { modo: "fecha" }))), "pc-ubicar-modo"))),
-                    React.createElement("button", { id: "pc-ubicar-ok", disabled: !listo, onClick: confirmar, style: Object.assign(Object.assign({}, BR("primario", !listo)), { width: "100%", padding: 14, fontSize: 15 }) }, listo ? ("Ubicar en " + (nuevo ? String(nuevo.name).trim() : elegido.name)) : "Elegí un recorrido"),
+                    chocaU.length > 0 && React.createElement("div", { id: "pc-ubicar-choca", style: { fontSize: 12.5, color: C.amb, fontWeight: 700, lineHeight: 1.4 } }, (ubicar.modo === "fecha" ? "Ese día" : "Los " + diasTxtY(chocaU)) + " ya sale con " + elegido.name + " por su otro plan: elegí otro recorrido."),
+                    React.createElement("button", { id: "pc-ubicar-ok", disabled: !listo, onClick: confirmar, style: Object.assign(Object.assign({}, BR("primario", !listo)), { width: "100%", padding: 14, fontSize: 15 }) }, listo ? ("Ubicar en " + (nuevo ? String(nuevo.name).trim() : elegido.name)) : chocaU.length ? "Elegí otro recorrido" : "Elegí un recorrido"),
                     React.createElement("div", { style: { fontSize: 12, color: C.mut, textAlign: "center" } }, "Cambiar de recorrido no cambia lo que paga."))));
         })(),
         avisoG && (() => {
@@ -16252,6 +16382,7 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
     const gidsGuardados = new Set(editD ? (((mDogs || []).find(d => d.id === editD.id) || {}).groups || []).map(g => g.id) : []);
     const faltaPrecioEdit = editD ? (editD.groups || []).some(g => !gidsGuardados.has(g.id) && grpSinPrecio(g)) : false;
     const faltaInicioEdit = editD ? (editD.groups || []).some(g => !gidsGuardados.has(g.id) && !g.suelto && !g.desde) : false;
+    const dobleEdit = editD ? planesConDoble(editD.groups) : null;
     // Lista de clientes (26/10/2026): lo que debe cada uno = la misma cuenta que su ficha y Cobros.
     const activosL = clients.filter(c => !c.archivado);
     const ecL = !sel ? estadoCobroClientes({ clients, mDogs, paseos, wk, ajustes: ajustes || {}, congeladas, ajPeriodo: ajPeriodo || {}, adiestramiento, guarderias }) : {};
@@ -16964,6 +17095,7 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
                         React.createElement("div", { id: "pc-perro-notas", style: { marginTop: 10 } },
                             React.createElement("label", { style: LBL }, "Notas"),
                             React.createElement(TextoAuto, { value: editD.notes || "", rows: 3, onChange: e => setEditD(d => (Object.assign(Object.assign({}, d), { notes: e.target.value }))), placeholder: "Carácter, miedos, cómo se lleva con otros, premios, lo que no puede comer...", style: Object.assign(Object.assign({}, INP), { resize: "vertical", fontFamily: "inherit", lineHeight: 1.4 }) })))))),
+            dobleEdit && React.createElement("div", { id: "pc-falta-doble", style: { fontSize: 12, color: C.amb, background: C.amb + "11", border: `1px solid ${C.amb}44`, borderRadius: 10, padding: "9px 11px", marginTop: 12, lineHeight: 1.4 } }, "Dos planes salen con el mismo recorrido los " + diasTxtY(dobleEdit.dias) + ": cambiá uno en \"Sale con\" (otro recorrido o Sin recorrido)."),
             faltaInicioEdit && React.createElement("div", { id: "pc-falta-inicio", style: { fontSize: 12, color: C.amb, background: C.amb + "11", border: `1px solid ${C.amb}44`, borderRadius: 10, padding: "9px 11px", marginTop: 12, lineHeight: 1.4 } }, "Falta cuándo empieza el plan nuevo: elegilo en \"Empieza el\"."),
             faltaPrecioEdit && React.createElement("div", { style: { fontSize: 12, color: C.amb, background: C.amb + "11", border: `1px solid ${C.amb}44`, borderRadius: 10, padding: "9px 11px", marginTop: 12, lineHeight: 1.4 } }, "Al plan que agregaste le falta el precio. Cargá cuánto paga: sin eso la app no sabe cuánto cobrarle."),
             React.createElement("div", { style: { fontSize: 12, color: C.mut, marginTop: 12, lineHeight: 1.4 } }, (["", svcVe(svc, "est") && "las estadías", svcVe(svc, "cla") && "las clases", "las ausencias"].filter(Boolean).join(", ").replace(/, ([^,]*)$/, " y $1").replace(/^./, c => c.toUpperCase())) + " se guardan al crearlas. Lo demás se guarda con \"Guardar\"."),
@@ -16971,7 +17103,7 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
                 const cambios = hayCambiosPerro(editD, dogs.find(d => d.id === editD.id));
                 return (React.createElement("div", { style: { display: "flex", gap: 8, marginTop: 12 } },
                     React.createElement("button", { onClick: () => setEditD(null), style: Object.assign(Object.assign({}, BR("secundario", false)), { flex: 1 }) }, "Cancelar"),
-                    React.createElement("button", { id: "pc-guardar-perro", onClick: saveEditDog, disabled: faltaPrecioEdit || faltaInicioEdit, style: Object.assign(Object.assign({}, BR("primario", false)), { flex: 2, opacity: (faltaPrecioEdit || faltaInicioEdit) ? .45 : 1, cursor: (faltaPrecioEdit || faltaInicioEdit) ? "not-allowed" : "pointer" }) },
+                    React.createElement("button", { id: "pc-guardar-perro", onClick: saveEditDog, disabled: faltaPrecioEdit || faltaInicioEdit || !!dobleEdit, style: Object.assign(Object.assign({}, BR("primario", false)), { flex: 2, opacity: (faltaPrecioEdit || faltaInicioEdit || dobleEdit) ? .45 : 1, cursor: (faltaPrecioEdit || faltaInicioEdit || dobleEdit) ? "not-allowed" : "pointer" }) },
                         "Guardar",
                         cambios && React.createElement("span", { style: { marginLeft: 8, fontSize: 11, fontWeight: 800, background: C.amb + "33", color: "#fbbf24", borderRadius: 6, padding: "1px 6px" } }, "hay cambios"))));
             })(),
@@ -17036,7 +17168,7 @@ function Clientes({ svc, setGuarderias, setAdiestramiento, onAbrirAcuerdos, setW
                     React.createElement("input", { id: "pc-alta-primer-in", type: "date", value: nDog.inicioManual || "", onChange: e => setNDog(d => (Object.assign(Object.assign({}, d), { inicioManual: e.target.value }))), style: Object.assign(Object.assign({}, INP), { border: nDog.inicioManual ? INP.border : `1px solid ${C.amb}` }) }),
                     React.createElement("div", { id: "pc-alta-primer-atajos", style: { display: "flex", gap: 6, marginTop: 6 } }, [["Hoy", T], ["Mañana", addDays(T, 1)]].map(([t, f]) => (React.createElement("button", { key: t, type: "button", className: "pc-alta-primer-atajo", "data-f": f, onClick: () => setNDog(d => (Object.assign(Object.assign({}, d), { inicioManual: f }))), style: { padding: "6px 12px", borderRadius: 999, border: `1.5px solid ${nDog.inicioManual === f ? C.grn : C.bdr}`, background: nDog.inicioManual === f ? C.grn + "22" : "transparent", color: nDog.inicioManual === f ? C.grn : C.mut, fontWeight: 800, fontSize: 12.5, cursor: "pointer", fontFamily: "inherit" } }, t)))),
                     React.createElement("div", { style: { fontSize: 12, color: nDog.inicioManual ? C.mut : C.amb, marginTop: 4, lineHeight: 1.4 } }, nDog.inicioManual ? (nDog.inicioManual > T ? "No se generan paseos antes de esa fecha." : "Ya lo venías paseando: sirve para la antigüedad. No se generan paseos hacia atrás.") : "Obligatorio. Si todavía no empieza, poné el día que arranca.")),
-                para.paseo && React.createElement(DogGrpsEd, { draft: nDog, set: setNDog, gg: gg, cfg: cfg, abierto: true, embebido: true, enLinea: true, habitual: cobroHabitual(mDogs, cfg) }),
+                para.paseo && React.createElement(DogGrpsEd, { draft: nDog, set: setNDog, gg: gg, setGG: setGG, cfg: cfg, abierto: true, embebido: true, enLinea: true, habitual: cobroHabitual(mDogs, cfg) }),
                 React.createElement("button", { id: "pc-alta-mas", onClick: () => setAltaMas(v => !v), style: { display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%", textAlign: "left", gap: 8, padding: "10px 12px", borderRadius: 10, border: `1px dashed ${C.bdr}`, background: "transparent", color: C.mut, fontSize: 13, fontWeight: 700, cursor: "pointer" } },
                     React.createElement("span", null, "Más datos (opcional): raza, notas, nacimiento"),
                     React.createElement("span", null, altaMas ? "▲" : "▼")),
@@ -18816,7 +18948,7 @@ function tutoTexto(t, svc) {
 function tutoPasos(k, svc) { const t = TUTO_PASOS[k]; return t ? t.pasos.map(p => tutoTexto(p, svc)).filter(Boolean) : []; }
 const TUTO_PASOS = {
     editar: { titulo: "Editar ruta", tab: "agenda", nombre: "Editar una ruta", desc: "Ordená los perros y ajustá los horarios del día.", pasos: ["En la Agenda, abrí el paseo del día (tocalo en el cuadro 'Hoy'). Arriba, al lado de Mapa y Avisar, tocá '✏️ Editar': aparecen las flechas, los minutos y los lugares. Cuando terminás, '✓ Listo' (abajo de la lista) vuelve a la vista de caminar.", "{rut:En '→ Ida' ordenás}{!rut:Ordenás} la recogida con las flechas de subir y bajar de cada perro, y en cada uno cargás los minutos hasta él: lo que tardás desde la parada anterior. Si dos perros viven en el mismo lugar dice 'igual'.", "{rut:Tocá '← Vuelta' y hacé lo mismo con la devolución: tiene su propio orden. 'Resetear orden' la deja como la ida.}", "Los horarios se calculan solos: a la hora de salida del recorrido le suma los minutos de cada tramo y los que te quedás en la plaza.", "Arriba y abajo de los perros están las fichas azules de Inicio, Plaza y Final: ahí elegís el lugar de cada punto, la hora de salida y los minutos en la plaza. Al cargar un punto o la hora, la app pregunta si vale 'Solo hoy' o 'Siempre'. Si un día tiene datos propios, aparece un aviso con 'Volver a lo de siempre'.", "{rut:Los kilómetros salen de tu ritmo caminando, que se configura una sola vez: Menú → Configuración → '🐾 Paseos' → 'Tu ritmo caminando'.}"] },
-    agenda: { titulo: "Agenda", tab: "agenda", nombre: "Conocé la Agenda", desc: "El día a día: paseos, estadías, clases, ventas y la ruta.", pasos: ["Arriba ves el día elegido: con ‹ y › pasás al día anterior o al siguiente, y tocando la fecha se abre el mes entero. Debajo, la semana con puntitos: verde = paseo{cla:, azul = clase}{est:, ámbar = estadía} (gris cuando ya está hecho).", "El cuadro 'Hoy' muestra todo lo del día en orden de hora: {y:tus recorridos de paseo;cla=las clases;est=las estadías}{ven: (y las ventas, si hubo)}. Abajo no aparece nada hasta que tocás un renglón: ahí se ve solo eso (tocalo otra vez para cerrarlo). Si el día está vacío, te muestra lo próximo que tenés. Ahí también, en 'Para tener en cuenta', salen los avisos: cumpleaños, vacunas, ausencias, clientes con deuda vencida y si hace rato que no guardás una copia de tus datos (💾 backup: tocalo para guardarla, o ✕ para que te lo recuerde mañana).", "Debajo de la semana, '＋ Cargar' tiene {est|cla|ven:los servicios que das a la vista: }{!est&!cla&!ven:el botón }{y:🐾 Paseo (un plan fijo o un paseo suelto);est=🏠 Estadía;cla=🎓 Clase;ven=🛍️ Venta}. Un toque y cargás {est|cla|ven:ese}{!est&!cla&!ven:un paseo}: viene con el día que tenés elegido y lo cambiás adentro. En el cuadro del día, '🧭 Recorridos' abre tus recorridos para crear o cambiar uno. Los perros sin recorrido aparecen en 'Sin recorrido' con 'Ubicar': elegís con qué recorrido salen (todos sus días, solo ese día de la semana o solo hoy). El recorrido nunca cambia lo que pagan.", "El paseo está pensado para usarlo caminando: una línea por perro con la hora en que lo retirás, 💬 para escribirle al dueño y ⋯ para cancelarlo o moverlo (también para ver la dirección en el mapa). Los perros del mismo dueño que salen juntos van en una sola línea; si le pasa algo a uno, ⋯ te pregunta a cuál. Arriba, 'Mapa' abre el recorrido en Google Maps y '📢 Avisar' le escribe a todo el recorrido{rut:; debajo, con la barra 'Ida / Vuelta / Informe' cambiás de vista}.", "Para cambiar el orden, los minutos entre perros, la plaza o el lugar de salida, tocá '✏️ Editar recorrido' (abajo de la lista) y cuando terminás '✓ Listo'. Así no se tocan por error mientras caminás.", "'✓ Completar paseo' queda siempre a mano abajo de la pantalla: marca de una vez todos los perros pendientes del recorrido."] },
+    agenda: { titulo: "Agenda", tab: "agenda", nombre: "Conocé la Agenda", desc: "El día a día: paseos, estadías, clases, ventas y la ruta.", pasos: ["Arriba ves el día elegido: con ‹ y › pasás al día anterior o al siguiente, y tocando la fecha se abre el mes entero. Debajo, la semana con puntitos: verde = paseo{cla:, azul = clase}{est:, ámbar = estadía} (gris cuando ya está hecho).", "El cuadro 'Hoy' muestra todo lo del día en orden de hora: {y:tus recorridos de paseo;cla=las clases;est=las estadías}{ven: (y las ventas, si hubo)}. Abajo no aparece nada hasta que tocás un renglón: ahí se ve solo eso (tocalo otra vez para cerrarlo). Si el día está vacío, te muestra lo próximo que tenés. Ahí también, en 'Para tener en cuenta', salen los avisos: cumpleaños, vacunas, ausencias, clientes con deuda vencida y si hace rato que no guardás una copia de tus datos (💾 backup: tocalo para guardarla, o ✕ para que te lo recuerde mañana).", "Debajo de la semana, '＋ Cargar' tiene {est|cla|ven:los servicios que das a la vista: }{!est&!cla&!ven:el botón }{y:🐾 Paseo (un plan fijo o un paseo suelto);est=🏠 Estadía;cla=🎓 Clase;ven=🛍️ Venta}. Un toque y cargás {est|cla|ven:ese}{!est&!cla&!ven:un paseo}: viene con el día que tenés elegido y lo cambiás adentro. Debajo de los servicios, '🧭 Crear o editar recorridos' abre tus recorridos. Los perros sin recorrido aparecen en 'Sin recorrido' con 'Ubicar': elegís con qué recorrido salen (todos sus días, solo ese día de la semana o solo hoy). El recorrido nunca cambia lo que pagan.", "El paseo está pensado para usarlo caminando: una línea por perro con la hora en que lo retirás, 💬 para escribirle al dueño y ⋯ para cancelarlo o moverlo (también para ver la dirección en el mapa). Los perros del mismo dueño que salen juntos van en una sola línea; si le pasa algo a uno, ⋯ te pregunta a cuál. Arriba, 'Mapa' abre el recorrido en Google Maps y '📢 Avisar' le escribe a todo el recorrido{rut:; debajo, con la barra 'Ida / Vuelta / Informe' cambiás de vista}.", "Para cambiar el orden, los minutos entre perros, la plaza o el lugar de salida, tocá '✏️ Editar recorrido' (abajo de la lista) y cuando terminás '✓ Listo'. Así no se tocan por error mientras caminás.", "'✓ Completar paseo' queda siempre a mano abajo de la pantalla: marca de una vez todos los perros pendientes del recorrido."] },
     clientes: { titulo: "Clientes", tab: "clientes", nombre: "Conocé Clientes", desc: "Tus clientes, sus perros y los informes.", pasos: ["La lista muestra cada cliente con sus perros, íconos de lo que usa ahora ({y:🐾 paseo;est=🏠 estadía;cla=🎓 clases}) y lo que te debe. Arriba buscás con 🔍 y filtrás: {est|cla:Todos, }{!est&!cla:Todos o }'💰 Deben' (el globito dice cuántos te deben){est|cla:, o por servicio: {y:🐾 Paseo;est=🏠 Estadía;cla=🎓 Clases}}. Si tenés más de un recorrido, abajo aparece 'Recorrido' para ver uno solo. El botón de WhatsApp de cada renglón abre el chat.", "'+ Añadir' crea un cliente nuevo: en Chrome podés elegirlo de tus contactos, y el WhatsApp lo escribís como te salga (11 1234-5678, 15…): abajo ves cómo queda y con 'Probar' abrís el chat. Al tocar 'Crear' seguís directo con su perro, y al terminar podés sumar otro perro del mismo cliente con el mismo plan y precio.", "Tocá un cliente para abrir su ficha. Arriba, botones rápidos: 💬 WhatsApp, 📞 Llamar y 🗺️ Cómo llegar (abre Google Maps con su dirección). Enseguida sus perros: tocá uno para editarlo, o el renglón de su plan (el del ✏️) para ir directo a ese plan. Con '+ Perro' le sumás otro. Después lo que te debe, con '💰 Cobrar'. Abajo, plegados y con la misma forma: Mensajes, Acuerdo de servicio, Enviar informe, Cancelaciones e Historial de aumentos. El descuento permanente (%) se carga con '✏️ Editar' del cliente y se aplica en Cobros.", "Tocá un perro para editarlo, o tocá directo el renglón de su plan (el del ✏️) y se abre ya ahí, con el precio listo para cambiar. Cada parte es un renglón con su resumen que se abre tocándolo: Paseos (su plan: días, precio, cómo te paga y con qué recorrido sale; en ⋯ le ponés nombre o lo terminás){est:, Estadías}{cla:, Clases}, Comida y remedios, Ausencias largas, Incidentes (si hubo) y Datos del perro (primer paseo, raza, veterinario, vacunas). En Datos del perro, con '+ Agregar dato' sumás tus propios datos (ej. 'Pretal o collar'): aparecen en todos los perros y, si tildás pedírselo al cliente, van en los mensajes de 'Solicitar datos' cuando están vacíos. 'Eliminar perro' está al final.", "En la ficha, 'Enviar informe' arma un resumen {rut:(día, semana o mes) para mandar por WhatsApp, financiero o de ruta}{!rut:(semana o mes) para mandar por WhatsApp}. {est:Si tiene una estadía, 'Confirmación de estadía' arma el mensaje con fechas, horarios y qué llevar. }Al final podés archivar al cliente: sale de la lista pero conserva su historial.", "Si un cliente deja de venir, en '✏️ Editar' del cliente tocá '👋 Deja el servicio': elegís el último día que pasea y cómo le cobrás ese mes o semana ('No se cobra', 'Otro monto' con el proporcional como sugerencia, o 'Entero'). Si ya te había pagado de más{est|cla:, o tiene {o:est=estadías;cla=clases} por delante}, te pregunta qué hacés con eso ('Se la devuelvo' o 'Me la quedo'). Al día siguiente del último se archiva solo, y se puede deshacer desde Editar cliente.", "En '💬 WhatsApp' tocás un cliente y ves todos los mensajes que le tocan, o en 'Por mensaje' elegís uno y a quién mandárselo. Si un mensaje no lo usás, tocá 📦: lo archivás solo para ese cliente o para todos. Queda en '📦 Archivados' y con 'Volver a usar' vuelve. En ☰ > Mensajes de WhatsApp apagás 'Lo uso' en los que nunca mandes, le cambiás el título a cualquiera y con '+ Mensaje nuevo' creás los tuyos. En los pedidos de datos, 'Qué le preguntás' te deja elegir qué preguntar; con '+ Agregar pregunta' sumás las tuyas, con un título corto para la lista y el texto que va en el mensaje (se editan con ✏️)."] },
     cobros: { titulo: "Cobros", tab: "cobros", nombre: "Conocé Cobros", desc: "Quién te debe y cómo registrar los pagos.", pasos: ["Cobros muestra quién te debe. Arriba elegís el período (Semana o Mes) y ves dos números: lo cobrado{est|cla|ven: ({y:paseos;est=estadías;cla=clases;ven=ventas de artículos})} y 'Falta cobrar', con '+ $X de antes' si alguien arrastra deuda de períodos anteriores. Son los mismos números del encabezado y de Stats. Tocando lo cobrado ves '💰 Lo que entró: quién pagó y cuánto'.", "Abajo está la lista 'Te deben': cada cliente con lo de este período y lo de antes. {est|cla:Con los filtros Todos / 🐾{est: / 🏠}{cla: / 🎓} ves solo {o:paseos;est=estadías;cla=clases}. }Los que no deben nada quedan plegados en '✓ Al día'.", "Tocá un cliente para abrir su ficha de cobro: el recuadro 'Te debe' separa lo de esta semana (o mes) y lo de antes, y con '📲 Mandarle lo que debe por WhatsApp' le mandás el detalle.", "'Cobrar' registra el pago. Si además arrastra deuda de antes, te pregunta '¿Cuánto te pagó?': todo, solo esta semana, solo lo de antes u otro monto (se aplica primero a lo más viejo). Con 'Pago parcial' cobrás solo una parte. El total no se edita acá: si necesitás corregirlo, en la misma ficha tenés '＋ Ajuste': elegís {est|cla:a qué se lo aplicás ({o:los paseos;est=una estadía;cla=unas clases}), }− (descuento, va a Perdiste) o + (recargo), el monto, y tocás 'Aplicar', que pide confirmación. Queda en 'Ajustes cargados' con ✕ para quitarlo; si cargás otro, se suma.", "'Adelanto de paseos' es para cuando el cliente te paga por adelantado, a cuenta de paseos que todavía no hizo: queda como saldo a favor. Los abonos mensuales{cla: y las clases} que te pagan por adelantado cuentan como cobrados en la semana (y el mes) en que te pagan.", "{est|cla:Las {y:est=estadías;cla=clases} también se cobran acá, aparte de los paseos (o directo desde su ficha en la Agenda, con 'Cobrar'): con el filtro {o:est=🏠;cla=🎓} ves solo esas. Cada una tiene su propio tutorial con el detalle.}"] },
     stats: { titulo: "Stats", tab: "stats", nombre: "Conocé Stats", desc: "Tu negocio en números.", pasos: ["Stats es tu negocio en números. Tiene {rut:4 solapas: Resumen, Plata, Clientes y Rutas}{!rut:3 solapas: Resumen, Plata y Clientes}. En Resumen{rut: y Rutas} elegís el período (Semana o Mes) y lo movés con las flechas.", "Arriba del Resumen ves 'Ya cobraste', 'Falta cobrar' (con lo 'de antes' si alguien arrastra deuda) y 'Perdiste' (cancelaciones, descuentos y lo que decidiste no cobrar): son los mismos números que Cobros. Tocá la pérdida para ver de dónde sale: cancelados, descuentos, ausencias, semanas sin paseos. En el Mes, abajo, la comparación con el mes pasado al mismo día y lo cobrado en los últimos 6 meses.", "{est|cla|ven:'¿De dónde salió la plata?' reparte lo cobrado entre {y:paseos;est=estadías;cla=clases;ven=ventas}: tocá uno para ver su detalle abajo.}{!est&!cla&!ven:'¿De dónde salió la plata?' muestra lo cobrado por paseos: tocalo para ver el detalle abajo.} En paseos, 'Semana a semana' lista las semanas del mes: tocá una para ver su detalle por perro, y con la flecha ← volvés al mes. '👀 Para mirar' te avisa si un cliente dejó de venir o cancela seguido, con un botón para escribirle.", "En Plata ves cuánto cobrás por mes en promedio, {est|cla|ven:cómo se reparte, los promedios de cada servicio, } tus récords y los gráficos de los últimos meses. En Clientes tenés el ranking de clientes y, con el botón Perros, el de asistencia.", "{rut:En Rutas ves los km y el tiempo en la calle, y una línea por perro: tocála para ver el detalle.}"] },
@@ -20589,7 +20721,7 @@ function App() {
                     React.createElement("div", { style: { flex: 1, minWidth: 0, fontSize: 13, color: C.txt, lineHeight: 1.45 } }, guia.listo || guiaPaso(guia.k)),
                     React.createElement("button", { id: "pc-guia-cerrar", "aria-label": "Cerrar", onClick: () => setGuia(null), style: { background: "none", border: "none", color: C.mut, fontSize: 15, cursor: "pointer", padding: "0 2px", flexShrink: 0 } }, "✕"))),
                 tab === "agenda" && (() => {
-                    const nov = novedadesPendientes(novVisto, (clients || []).length > 0).slice(0, 2);
+                    const nov = novedadesPendientes(novVisto, (clients || []).length > 0).slice(0, 3);
                     if (!nov.length)
                         return null;
                     return (React.createElement("div", { id: "pc-novedades", style: { background: C.card, border: `1.5px solid ${C.blu}66`, borderRadius: 14, padding: "12px 12px 8px", marginBottom: 14 } },
