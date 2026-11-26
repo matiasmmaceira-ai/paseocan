@@ -2496,7 +2496,7 @@ function nombreDato(k) { return NOMBRE_DATO[k] || k; }
 // HTML: la base solo deja hacer lo que permiten sus reglas (RLS). NUNCA poner acá la secret/service_role.
 const SUPA_URL = "https://zwuakvfsgesdeiioimcj.supabase.co";
 const SUPA_KEY = "sb_publishable_aIkR9AH_aUigZVcm_eNlKQ_1eMtomWx";
-const APP_VER = "2026-11-26a";
+const APP_VER = "2026-11-26b";
 // Contador anónimo (Matías: "¿vamos a saber cuánta gente la está usando?"): una vez por día que se abre
 // la app, manda un número al azar de este celular + la versión (desde el 21/11 también % de espacio, rango de
 // paseos y si usa la nube: ver usoParaContar). Sin nombre, mail ni datos de clientes o plata. La
@@ -4690,6 +4690,8 @@ function adiestraFechasBase(a) {
         const d = new Date(start);
         d.setDate(start.getDate() + i);
         const f = d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+        if (enPausaSerie(b, f))
+            continue;
         const t = tramoHorarioEn(b, f);
         const sch = (t.schedule && t.schedule.length) ? t.schedule : [dow0];
         if (sch.includes(d.getDay()))
@@ -4747,6 +4749,57 @@ function cambiarSerieDesde(a, desde, nuevo) {
     Object.keys(b.horasMovidas || {}).forEach(k => { if (k < desde)
         horasMovidas[k] = b.horasMovidas[k]; });
     return Object.assign(Object.assign(Object.assign({}, b), nv), { tramosHorario: tramos, movidas, omitidas, horasMovidas, nClases });
+}
+// ── CORRER LAS CLASES QUE FALTAN (26/11/2026, Matías: "quise mover el resto de una serie de una semana a la
+// otra y me movió todo y quedaron sin dictar las que estaban dictadas", BUG-109). Antes la única forma era
+// cambiar "Empieza desde el", que corre la serie ENTERA: las dictadas pasaban a otras fechas y sus marcas
+// (guardadas por fecha) quedaban colgadas. Ahora: una PAUSA [desde, hasta) en las fechas base. Las clases de
+// antes quedan donde estaban (dictadas, notas y pagos intactos); las que faltan siguen los mismos días desde
+// la fecha nueva. La cantidad no cambia. La pausa sobrevive a un cambio de días posterior (cambiarSerieDesde).
+function enPausaSerie(b, f) { return ((b && b.pausas) || []).some(p => p && p.desde && p.hasta && f >= p.desde && f < p.hasta); }
+// serieEmpezada: hay clases antes de la próxima que falta (dictadas o ya pasadas) → "Empieza desde el" no se
+// puede cambiar (correría también esas).
+function serieEmpezada(a, T) { const b = ensureAdiestra(a || {}); const p = primeraParaCambiar(b, T); return adiestraFechas(b).some(f => f < p); }
+// correrPendientes(a, fechaNueva, T): las clases que faltan (desde la próxima sin dictar) pasan a arrancar en
+// fechaNueva (posterior). Pura. Devuelve la serie igual si no hay nada que correr.
+function correrPendientes(a, fechaNueva, T) {
+    const b = ensureAdiestra(a || {});
+    const H = T || td();
+    const p0 = primeraParaCambiar(b, H);
+    const fs = adiestraFechas(b);
+    const pend = fs.filter(f => f >= p0 && !claseDada(b, f));
+    if (!fechaNueva || !pend.length || fechaNueva <= p0)
+        return b;
+    let desde = pend.map(f => claseBaseFecha(b, f)).sort()[0];
+    // Una clase movida para antes (y que se queda) no se rearma: la pausa arranca después de su día base.
+    Object.keys(b.movidas || {}).forEach(k => { if (b.movidas[k] < p0 && k >= desde)
+        desde = addDays(k, 1); });
+    if (fechaNueva <= desde)
+        return b;
+    // Los cambios puntuales de las que se rearman ya no aplican (igual que en cambiarSerieDesde).
+    const movidas = {}, omitidas = {}, horasMovidas = {};
+    let nClases = b.nClases;
+    Object.keys(b.movidas || {}).forEach(k => { if (k < desde)
+        movidas[k] = b.movidas[k]; });
+    Object.keys(b.omitidas || {}).forEach(k => { if (k < desde)
+        omitidas[k] = b.omitidas[k];
+    else
+        nClases = Math.max(1, nClases - 1); });
+    Object.keys(b.horasMovidas || {}).forEach(k => { if (k < desde)
+        horasMovidas[k] = b.horasMovidas[k]; });
+    const pausas = [...(b.pausas || []).filter(x => x && x.desde && x.hasta), { desde, hasta: fechaNueva }];
+    const out = Object.assign(Object.assign({}, b), { pausas, movidas, omitidas, horasMovidas, nClases });
+    // Notas de las que faltan (sin dictar, por ejemplo una nota previa): van con su clase, en orden.
+    const nuevas = adiestraFechas(out).filter(f => f >= fechaNueva);
+    let clases = b.clases;
+    pend.forEach((f, i) => { if (clases[f] && nuevas[i] && nuevas[i] !== f) {
+        const c = Object.assign({}, clases);
+        const v = c[f];
+        delete c[f];
+        c[nuevas[i]] = v;
+        clases = c;
+    } });
+    return Object.assign(Object.assign({}, out), { clases });
 }
 // adiestraFechas: fechas REALES de clase = base, sacando las omitidas y aplicando las
 // movidas (fecha base -> fecha nueva). Ordenadas. Determina el total (nClases efectivo).
@@ -5915,6 +5968,9 @@ function avisosDeLaApp({ servicios, backup, shareMsg, primeros, nube, nubeCf, es
 // Solo lo que el paseador nota (nunca lo interno). La más nueva va PRIMERO. Una versión sin nada visible no se agrega.
 // En el celular se guarda la última vista (pc_novedades_visto, no viaja: cada aparato la ve una vez).
 const NOVEDADES = [
+    { ver: "2026-11-26b", fecha: "26/11/2026", items: [
+            "Clases: al editar una serie ya empezada, \"Las que faltan arrancan el\" corre solo las clases que faltan. Las dictadas quedan como estaban.",
+        ] },
     { ver: "2026-11-26a", fecha: "26/11/2026", items: [
             "En la Agenda, \"Crear o editar recorridos\" ahora es un botón ancho debajo de los servicios.",
             "Al armar el plan de un perro, en \"Sale con\" podés elegir \"Recorrido nuevo\": se crea ya armado y queda elegido.",
@@ -19952,8 +20008,13 @@ function App() {
                 if (x.id !== nClase.editId)
                     return x;
                 // Días/horario: desde la fecha elegida (las clases anteriores quedan como estaban).
-                let y = Object.assign(Object.assign({}, x), { dogId: nClase.dogId, desde, nClases, notas, objetivo: String(nClase.objetivo || "").trim() });
-                y = cambiarSerieDesde(y, nClase.cambioDesde || primeraParaCambiar(x, T), { schedule, horaDesde, horaHasta });
+                // 26/11/2026 (BUG-109): con la serie empezada, el inicio NO se toca (correría las dictadas); "Las que
+                // faltan arrancan el" corre solo las pendientes.
+                const emp = recur && serieEmpezada(x, T);
+                let y = Object.assign(Object.assign({}, x), { dogId: nClase.dogId, desde: emp ? x.desde : desde, nClases, notas, objetivo: String(nClase.objetivo || "").trim() });
+                if (emp && nClase.correrDesde)
+                    y = correrPendientes(y, nClase.correrDesde, T);
+                y = cambiarSerieDesde(y, nClase.cambioDesde && !(emp && nClase.correrDesde) ? nClase.cambioDesde : primeraParaCambiar(y, T), { schedule, horaDesde, horaHasta });
                 return (Number(x.precio) || 0) !== precio ? setPrecioAdiestra(y, precio, pDesde) : y;
             }));
         }
@@ -20721,7 +20782,7 @@ function App() {
                     React.createElement("div", { style: { flex: 1, minWidth: 0, fontSize: 13, color: C.txt, lineHeight: 1.45 } }, guia.listo || guiaPaso(guia.k)),
                     React.createElement("button", { id: "pc-guia-cerrar", "aria-label": "Cerrar", onClick: () => setGuia(null), style: { background: "none", border: "none", color: C.mut, fontSize: 15, cursor: "pointer", padding: "0 2px", flexShrink: 0 } }, "✕"))),
                 tab === "agenda" && (() => {
-                    const nov = novedadesPendientes(novVisto, (clients || []).length > 0).slice(0, 3);
+                    const nov = novedadesPendientes(novVisto, (clients || []).length > 0).slice(0, 4);
                     if (!nov.length)
                         return null;
                     return (React.createElement("div", { id: "pc-novedades", style: { background: C.card, border: `1.5px solid ${C.blu}66`, borderRadius: 14, padding: "12px 12px 8px", marginBottom: 14 } },
@@ -21452,9 +21513,25 @@ function App() {
                                         React.createElement("button", { onClick: () => setNClase(c => (Object.assign(Object.assign({}, c), { otraCant: true, nClases: ["4", "8", "12"].includes(String(c.nClases || "")) ? "" : c.nClases }))), style: { padding: "11px 4px", borderRadius: 12, border: `1.5px solid ${otra ? C.blu : C.bdr}`, background: otra ? C.blu + "22" : "transparent", color: otra ? "#60a5fa" : C.txt, fontSize: 14, fontWeight: 800, cursor: "pointer" } }, "Otra")),
                                     otra && React.createElement("input", { type: "number", inputMode: "numeric", value: nClase.nClases, placeholder: "¿Cuántas?", onChange: e => setNClase(c => (Object.assign(Object.assign({}, c), { nClases: e.target.value }))), style: Object.assign(Object.assign({}, INP), { marginTop: 8 }) }));
                             })()),
-                        React.createElement("div", null,
-                            React.createElement("label", { style: LBL }, "Empieza desde el"),
-                            React.createElement("input", { type: "date", value: nClase.desde, onChange: e => setNClase(c => (Object.assign(Object.assign({}, c), { desde: e.target.value }))), style: INP })))) : (React.createElement("div", null,
+                        (() => {
+                            const serie = nClase.editId ? (adiestramiento || []).find(x => x.id === nClase.editId) : null;
+                            if (!serie || !serieEmpezada(serie, T))
+                                return React.createElement("div", null,
+                                    React.createElement("label", { style: LBL }, "Empieza desde el"),
+                                    React.createElement("input", { type: "date", value: nClase.desde, onChange: e => setNClase(c => (Object.assign(Object.assign({}, c), { desde: e.target.value }))), style: INP }));
+                            // 26/11/2026 (BUG-109): serie empezada → se corren solo las que faltan.
+                            const p0 = primeraParaCambiar(serie, T);
+                            const fs = adiestraFechas(serie);
+                            const antes = fs.filter(f => f < p0).length;
+                            const dadas = fs.filter(f => claseDada(serie, f)).length;
+                            const pend = fs.length - antes;
+                            const cd = nClase.correrDesde || p0;
+                            const md = f => Number(f.slice(8, 10)) + "/" + Number(f.slice(5, 7));
+                            return React.createElement("div", { id: "pc-serie-correr" },
+                                React.createElement("label", { style: LBL }, "Las que faltan arrancan el"),
+                                React.createElement("input", { id: "pc-serie-correr-fecha", type: "date", value: cd, min: p0, onChange: e => setNClase(c => (Object.assign(Object.assign({}, c), { correrDesde: (e.target.value && e.target.value > p0) ? e.target.value : null }))), style: INP }),
+                                React.createElement("div", { style: { fontSize: 12, color: C.blu, marginTop: 6, lineHeight: 1.4, fontWeight: 600 } }, (antes > 0 ? ("Las " + antes + (antes === 1 ? " clase anterior" : " clases anteriores") + (dadas ? " (" + dadas + (dadas === 1 ? " dictada" : " dictadas") + ")" : "") + " quedan como estaban. ") : "") + (cd > p0 ? ("Las " + pend + " que faltan se corren: arrancan el " + md(cd) + ", los mismos días.") : ("Las " + pend + " que faltan siguen desde el " + md(p0) + ". Elegí una fecha posterior para correrlas."))));
+                        })())) : (React.createElement("div", null,
                         React.createElement("label", { style: LBL }, "Fecha"),
                         React.createElement("input", { type: "date", value: nClase.desde, onChange: e => setNClase(c => (Object.assign(Object.assign({}, c), { desde: e.target.value }))), style: INP }))),
                     React.createElement("div", null,
